@@ -61,3 +61,55 @@ export function errorMessage(err) {
   const fixed = MESSAGES[err?.code];
   return fixed || err?.message || MESSAGES.internal;
 }
+
+// ---- Spracheingabe: Diktat -> Ausgabe / Ort / Betrag ------------------------------------------
+// Das Ergebnis ist nur ein Vorschlag; der Benutzer prueft und korrigiert ihn immer vor dem Speichern.
+
+const PARTICIPLE = /^(ge[a-zäöüß]{3,}(?:t|en)|eingekauft|besorgt|bezahlt|ausgegeben)$/i;
+const PARTICIPLE_TEXT = { getankt: 'Tanken', eingekauft: 'Einkauf', gekauft: 'Einkauf', gegessen: 'Essen', bezahlt: '', ausgegeben: '' };
+const AMOUNT_PATTERNS = [
+  [/(\d+)\s*komma\s*(\d{1,2})\s*(?:euro|€)/i, (m) => parseAmount(`${m[1]},${m[2]}`)],
+  [/(\d+)\s*(?:euro|€)\s*(\d{1,2})(?!\d)(?:\s*cent)?/i, (m) => parseAmount(`${m[1]},${m[2].padEnd(2, '0')}`)],
+  [/(\d[\d.,]*)\s*(?:euro|€)/i, (m) => parseAmount(m[1])],
+  [/(?:^|\s)(\d+(?:[.,]\d{1,2})?)(?=\s|$)/, (m) => parseAmount(m[1])],
+];
+const upper = (s) => (s ? s[0].toLocaleUpperCase('de-DE') + s.slice(1) : s);
+const participle = (word) => PARTICIPLE_TEXT[word.toLowerCase()] ?? word;
+
+export function parseSpeech(input) {
+  const transcript = String(input ?? '').trim();
+  let text = ` ${transcript} `;
+  let betrag = null;
+
+  for (const [re, toAmount] of AMOUNT_PATTERNS) {
+    const m = re.exec(text);
+    if (!m) continue;
+    const value = toAmount(m);
+    if (Number.isNaN(value) || value <= 0) continue;
+    betrag = value;
+    text = text.replace(m[0], ' ');
+    break;
+  }
+
+  text = text.replace(/\s+/g, ' ').trim();
+  for (let i = 0; i < 3; i++) text = text.replace(/^(ich habe|ich hab|habe|hab|eine neue ausgabe|neue ausgabe|ausgabe|notiere|für|fuer|noch)\s+/i, '');
+  text = text.replace(/\s+(ausgegeben|bezahlt)$/i, '').replace(/^(ausgegeben|bezahlt)$/i, '');
+
+  let desc = '';
+  let place = '';
+  const prep = /^(.*?)\b(?:bei|beim|im|in der|in dem|in|vom|von|auf dem|am)\s+(.+)$/i.exec(text);
+  if (prep) {
+    const tokens = prep[2].split(' ');
+    const idx = tokens.findIndex((t, i) => i > 0 && PARTICIPLE.test(t));
+    place = (idx > 0 ? tokens.slice(0, idx) : tokens).join(' ');
+    const extra = idx > 0 ? tokens.slice(idx).map(participle).filter(Boolean).join(' ') : '';
+    desc = [prep[1].trim(), extra].filter(Boolean).join(' ');
+  } else {
+    desc = text.split(' ').map((t) => (PARTICIPLE.test(t) ? participle(t) : t)).filter(Boolean).join(' ');
+  }
+  if (!desc && place) {
+    desc = place; // "42 Euro im Restaurant": das Restaurant ist die Ausgabe
+    place = '';
+  }
+  return { ausgabe: upper(desc), ort: upper(place), betrag, transcript };
+}

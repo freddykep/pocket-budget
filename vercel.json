@@ -9,7 +9,8 @@
       "headers": [
         { "key": "Content-Security-Policy", "value": "default-src 'self'; img-src 'self' data:; style-src 'self'; script-src 'self'; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'" },
         { "key": "X-Content-Type-Options", "value": "nosniff" },
-        { "key": "Referrer-Policy", "value": "same-origin" }
+        { "key": "Referrer-Policy", "value": "same-origin" },
+        { "key": "Permissions-Policy", "value": "microphone=(self), camera=(self), geolocation=()" }
       ]
     },
     {

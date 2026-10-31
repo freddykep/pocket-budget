@@ -1,4 +1,4 @@
-import { ApiError, displayAmount, errorMessage, formatEuro, parseAmount, totalExpenses } from './util.js';
+import { ApiError, displayAmount, errorMessage, formatEuro, parseAmount, parseSpeech, totalExpenses } from './util.js';
 
 const $app = document.getElementById('app');
 const $sheet = document.getElementById('sheet');
@@ -155,7 +155,9 @@ function renderHome() {
         h('button', { id: 'refresh', class: 'icon-btn', 'aria-label': 'Aktualisieren', onclick: () => loadData(), }, h('span', { text: '↻' })),
         h('button', { class: 'icon-btn', 'aria-label': 'Verbindung und Einstellungen', onclick: openSettings, text: '⚙' })),
       h('div', { id: 'content' })),
-    h('div', { class: 'fab-bar' }, h('button', { class: 'btn', onclick: () => openEntrySheet(null), text: '＋ Ausgabe erfassen' })),
+    h('div', { class: 'fab-bar' }, h('div', { class: 'fab-inner' },
+      h('button', { class: 'btn grow', onclick: () => openEntrySheet(null), text: '＋ Ausgabe erfassen' }),
+      h('button', { class: 'btn secondary icon', 'aria-label': 'Per Sprache erfassen', onclick: openVoiceSheet, text: '🎤' }))),
   );
   paint();
 }
@@ -233,14 +235,14 @@ async function loadData() {
 
 // ---- Erfassen / Ändern -----------------------------------------------------------------------
 
-function openEntrySheet(entry) {
+function openEntrySheet(entry, prefill = null) {
   const isEdit = !!entry;
   // Eine ID pro geöffnetem Formular: Wiederholte Speicherversuche erzeugen keine Dublette.
   const id = isEdit ? entry.id : crypto.randomUUID();
   const values = {
-    ausgabe: entry?.ausgabe ?? '',
-    ort: entry?.ort ?? '',
-    betrag: entry ? String(Math.abs(entry.betrag)).replace('.', ',') : '',
+    ausgabe: entry?.ausgabe ?? prefill?.ausgabe ?? '',
+    ort: entry?.ort ?? prefill?.ort ?? '',
+    betrag: entry ? String(Math.abs(entry.betrag)).replace('.', ',') : prefill?.betrag ? String(prefill.betrag).replace('.', ',') : '',
   };
   showForm();
 
@@ -270,7 +272,11 @@ function openEntrySheet(entry) {
       h('div', { class: 'actions' },
         h('button', { type: 'button', class: 'btn ghost', onclick: closeSheet, text: 'Abbrechen' }),
         h('button', { type: 'submit', class: 'btn', text: 'Prüfen' })));
-    openSheet(h('h2', { text: isEdit ? 'Ausgabe ändern' : 'Ausgabe erfassen' }), form);
+    openSheet(
+      h('h2', { text: isEdit ? 'Ausgabe ändern' : 'Ausgabe erfassen' }),
+      prefill?.note ? h('p', { class: 'note', text: prefill.note }) : null,
+      form,
+    );
     form.querySelector(errors.ausgabe ? '[name=ausgabe]' : errors.ort ? '[name=ort]' : errors.betrag ? '[name=betrag]' : values.ausgabe ? '[name=betrag]' : '[name=ausgabe]')?.focus();
   }
 
@@ -323,6 +329,85 @@ function openEntrySheet(entry) {
       h('div', { class: 'actions' }, backBtn, saveBtn),
     );
   }
+}
+
+// ---- Spracheingabe --------------------------------------------------------------------------
+
+const speechApi = () => window.SpeechRecognition || window.webkitSpeechRecognition;
+
+const SPEECH_ERRORS = {
+  'not-allowed': 'Der Mikrofonzugriff wurde verweigert. Bitte erlaube das Mikrofon in den Einstellungen deines Browsers.',
+  'service-not-allowed': 'Die Spracherkennung ist in diesem Browser nicht erlaubt.',
+  'no-speech': 'Ich habe nichts gehört. Bitte noch einmal versuchen und deutlich sprechen.',
+  'audio-capture': 'Es wurde kein Mikrofon gefunden.',
+  network: 'Die Spracherkennung braucht eine Internetverbindung.',
+  'language-not-supported': 'Deutsch wird von der Spracherkennung dieses Browsers nicht unterstützt.',
+};
+
+function openVoiceSheet() {
+  const SpeechRecognition = speechApi();
+  if (!SpeechRecognition) {
+    return openSheet(
+      h('h2', { text: 'Spracheingabe' }),
+      h('p', { text: 'Dieser Browser unterstützt keine Spracheingabe. Am besten funktioniert sie in Chrome, Edge und Safari. Du kannst die Ausgabe stattdessen von Hand erfassen.' }),
+      h('div', { class: 'actions' },
+        h('button', { class: 'btn ghost', onclick: closeSheet, text: 'Schließen' }),
+        h('button', { class: 'btn', onclick: () => openEntrySheet(null), text: 'Von Hand erfassen' })),
+    );
+  }
+
+  const live = h('p', { class: 'transcript', 'aria-live': 'polite', text: 'Tippe auf „Aufnahme starten" und sage zum Beispiel: „Wocheneinkauf bei Rewe 84 Euro 50".' });
+  const errBox = h('div', { class: 'msg-error', role: 'alert', hidden: true });
+  const start = h('button', { class: 'btn', text: '🎤 Aufnahme starten', onclick: () => listen() });
+  let rec = null;
+  let transcript = '';
+
+  function listen() {
+    errBox.hidden = true;
+    transcript = '';
+    rec = new SpeechRecognition();
+    rec.lang = 'de-DE';
+    rec.interimResults = true;
+    rec.continuous = false;
+    rec.maxAlternatives = 1;
+    let failed = false;
+    rec.onstart = () => { start.disabled = true; start.textContent = 'Ich höre zu…'; live.textContent = '…'; };
+    rec.onresult = (ev) => {
+      transcript = [...ev.results].map((r) => r[0].transcript).join(' ').trim();
+      live.textContent = transcript || '…';
+    };
+    rec.onerror = (ev) => {
+      failed = true;
+      errBox.textContent = SPEECH_ERRORS[ev.error] || `Spracherkennung fehlgeschlagen (${ev.error}).`;
+      errBox.hidden = false;
+    };
+    rec.onend = () => {
+      start.disabled = false;
+      start.textContent = '🎤 Erneut aufnehmen';
+      if (failed || !transcript) {
+        if (!failed) { errBox.textContent = SPEECH_ERRORS['no-speech']; errBox.hidden = false; }
+        return;
+      }
+      const r = parseSpeech(transcript);
+      closeSheet();
+      // Nur ein Vorschlag: Der Benutzer prüft und bestätigt in den nächsten Schritten.
+      openEntrySheet(null, { ...r, note: `Erkannt: „${r.transcript}". Bitte prüfen und bei Bedarf korrigieren.` });
+    };
+    try {
+      rec.start();
+    } catch {
+      errBox.textContent = 'Die Aufnahme konnte nicht gestartet werden.';
+      errBox.hidden = false;
+    }
+  }
+
+  openSheet(
+    h('h2', { text: 'Spracheingabe' }),
+    live,
+    errBox,
+    h('p', { class: 'note', text: 'Die Spracherkennung läuft über deinen Browser (Chrome: Google, Safari: Apple). Dabei wird die Aufnahme an den Browser-Hersteller gesendet. Pocket Budget speichert keine Aufnahmen und speichert nichts, bevor du es bestätigst.' }),
+    h('div', { class: 'actions' }, h('button', { class: 'btn ghost', onclick: () => { rec?.abort(); closeSheet(); }, text: 'Abbrechen' }), start),
+  );
 }
 
 // ---- IDs ergänzen ----------------------------------------------------------------------------

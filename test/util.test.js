@@ -1,6 +1,6 @@
 import assert from 'node:assert/strict';
 import { test } from 'node:test';
-import { ApiError, displayAmount, errorMessage, parseAmount, totalExpenses } from '../public/util.js';
+import { ApiError, displayAmount, errorMessage, parseAmount, parseSpeech, totalExpenses } from '../public/util.js';
 
 test('parseAmount: deutsche und englische Schreibweisen', () => {
   const ok = { '84,50': 84.5, '84.50': 84.5, '84': 84, '1.234,56': 1234.56, '1.234': 1234, '1.234.567': 1234567, '0,5': 0.5, ' 42 € ': 42, '65,00': 65 };
@@ -30,4 +30,28 @@ test('errorMessage: feste Texte, sonst Servertext', () => {
   assert.equal(errorMessage(new ApiError('bad_layout', 'Spalten fehlen: id')), 'Spalten fehlen: id');
   assert.match(errorMessage(new Error('boom')), /boom/);
   assert.match(errorMessage(undefined), /Unerwarteter Fehler/);
+});
+
+
+test('parseSpeech: Beispiele aus der Anforderung', () => {
+  const pick = (t) => { const r = parseSpeech(t); return [r.ausgabe, r.ort, r.betrag]; };
+  assert.deepEqual(pick('42 Euro im Restaurant'), ['Restaurant', '', 42]);
+  assert.deepEqual(pick('Wocheneinkauf bei Rewe 84 Euro 50'), ['Wocheneinkauf', 'Rewe', 84.5]);
+  assert.deepEqual(pick('65 Euro bei Aral getankt'), ['Tanken', 'Aral', 65]);
+});
+
+test('parseSpeech: weitere Formulierungen', () => {
+  const pick = (t) => { const r = parseSpeech(t); return [r.ausgabe, r.ort, r.betrag]; };
+  assert.deepEqual(pick('Kaffee bei Starbucks 3,50 Euro'), ['Kaffee', 'Starbucks', 3.5]);
+  assert.deepEqual(pick('12 Komma 90 Euro Pizza'), ['Pizza', '', 12.9]);
+  assert.deepEqual(pick('3 Euro 20 Cent Brötchen'), ['Brötchen', '', 3.2]);
+  assert.deepEqual(pick('Ich habe 20 Euro für Blumen ausgegeben'), ['Blumen', '', 20]);
+  assert.deepEqual(pick('Bahnticket 29,90'), ['Bahnticket', '', 29.9]);
+});
+
+test('parseSpeech: ohne Betrag bleibt der Betrag leer', () => {
+  const r = parseSpeech('Bahnticket');
+  assert.equal(r.betrag, null);
+  assert.equal(r.ausgabe, 'Bahnticket');
+  assert.equal(parseSpeech('').betrag, null);
 });

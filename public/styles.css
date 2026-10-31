@@ -107,7 +107,11 @@ body {
   background: linear-gradient(to top, var(--bg) 70%, transparent);
   display: flex; justify-content: center; pointer-events: none;
 }
-.fab-bar .btn { pointer-events: auto; width: 100%; max-width: 608px; box-shadow: var(--shadow); font-size: 1.05rem; }
+.fab-inner { display: flex; gap: 10px; width: 100%; max-width: 608px; pointer-events: auto; }
+.fab-bar .btn { box-shadow: var(--shadow); font-size: 1.05rem; }
+.btn.grow { flex: 1; }
+.btn.icon { width: 56px; padding: 0; font-size: 1.4rem; }
+.transcript { font-size: 1.15rem; min-height: 3.2em; margin: 0 0 6px; padding: 14px; background: var(--bg); border-radius: 12px; overflow-wrap: anywhere; }
 
 /* Anmeldung / Dateiwahl */
 .hero { text-align: center; padding: 64px 8px 24px; }

@@ -24,6 +24,7 @@ const SECURITY_HEADERS = {
   'content-security-policy': "default-src 'self'; img-src 'self' data:; style-src 'self'; script-src 'self'; connect-src 'self'; frame-ancestors 'none'; base-uri 'none'; form-action 'self'",
   'x-content-type-options': 'nosniff',
   'referrer-policy': 'same-origin',
+  'permissions-policy': 'microphone=(self), camera=(self), geolocation=()',
 };
 
 const server = createServer(async (req, res) => {
