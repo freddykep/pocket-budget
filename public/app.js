@@ -602,7 +602,7 @@ function openMultiSheet({ entries, transcript }) {
       errBox.hidden = true;
       const records = items.map((it, i) => ({ id: it.rid, ausgabe: it.ausgabe.trim(), ort: it.ort.trim(), betrag: Math.abs(signed[i]), refund: it.refund }));
       try {
-        await api('/api/excel/append-many', { records });
+        await api('/api/excel/append', { records });
         closeSheet();
         toast(`${items.length} Ausgaben in Excel gespeichert`);
         await loadData();
