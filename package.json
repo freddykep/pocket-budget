@@ -1,0 +1,22 @@
+{
+  "name": "pocket-budget-onedrive-poc",
+  "version": "0.1.0",
+  "private": true,
+  "type": "module",
+  "description": "Isolierter Proof of Concept: OneDrive/Excel-Anbindung via Microsoft Graph",
+  "engines": {
+    "node": ">=22"
+  },
+  "scripts": {
+    "start": "node --env-file-if-exists=.env.local server.js",
+    "test": "node --test \"test/*.test.js\"",
+    "gen-key": "node scripts/gen-key.js"
+  },
+  "dependencies": {
+    "@neondatabase/serverless": "^1.2.0",
+    "jszip": "^3.10.1"
+  },
+  "devDependencies": {
+    "exceljs": "^4.4.0"
+  }
+}
