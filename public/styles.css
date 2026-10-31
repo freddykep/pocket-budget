@@ -170,4 +170,5 @@ dialog::backdrop { background: rgb(0 0 0 / 45%); }
   * { animation: none !important; transition: none !important; }
 }
 
+.check { display: flex; align-items: center; gap: 12px; min-height: 48px; margin: 0 0 6px; cursor: pointer; }
 input[type="checkbox"] { width: 24px; height: 24px; flex: none; accent-color: var(--primary); }

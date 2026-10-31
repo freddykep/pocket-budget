@@ -244,6 +244,8 @@ function openEntrySheet(entry, prefill = null) {
     ort: entry?.ort ?? prefill?.ort ?? '',
     betrag: entry ? String(Math.abs(entry.betrag)).replace('.', ',') : prefill?.betrag ? String(prefill.betrag).replace('.', ',') : '',
   };
+  // Standard: Ausgabe (negativ). Nur die Checkbox macht daraus eine Rückerstattung (positiv).
+  let refund = entry ? entry.betrag > 0 : false;
   showForm();
 
   function showForm(errors = {}) {
@@ -256,6 +258,7 @@ function openEntrySheet(entry, prefill = null) {
       ev.preventDefault();
       const fd = new FormData(ev.target);
       for (const k of Object.keys(values)) values[k] = String(fd.get(k) ?? '');
+      refund = fd.has('refund');
       const errs = {};
       if (!values.ausgabe.trim()) errs.ausgabe = 'Bitte eine Beschreibung eingeben.';
       else if (values.ausgabe.length > 200) errs.ausgabe = 'Maximal 200 Zeichen.';
@@ -269,6 +272,9 @@ function openEntrySheet(entry, prefill = null) {
       field('ausgabe', 'Ausgabe', { required: true, autocapitalize: 'sentences', enterkeyhint: 'next', placeholder: 'z. B. Wocheneinkauf' }),
       field('ort', 'Ort / Händler (optional)', { autocapitalize: 'sentences', enterkeyhint: 'next', placeholder: 'z. B. REWE' }),
       field('betrag', 'Betrag in Euro', { inputmode: 'decimal', enterkeyhint: 'done', placeholder: '0,00' }),
+      h('label', { class: 'check' },
+        h('input', { type: 'checkbox', name: 'refund', checked: refund }),
+        h('span', { text: 'Positiver Betrag (Rückerstattung)' })),
       h('div', { class: 'actions' },
         h('button', { type: 'button', class: 'btn ghost', onclick: closeSheet, text: 'Abbrechen' }),
         h('button', { type: 'submit', class: 'btn', text: 'Prüfen' })));
@@ -290,7 +296,7 @@ function openEntrySheet(entry, prefill = null) {
       saveBtn.disabled = backBtn.disabled = true;
       saveBtn.textContent = 'Speichert…';
       errBox.hidden = true;
-      const payload = { ausgabe: values.ausgabe.trim(), ort: values.ort.trim(), betrag: amount };
+      const payload = { ausgabe: values.ausgabe.trim(), ort: values.ort.trim(), betrag: amount, refund };
       try {
         if (isEdit) await api('/api/excel/update', { id, expectedHash: entry.hash, values: payload });
         else await api('/api/excel/append', { id, ...payload });
@@ -323,8 +329,10 @@ function openEntrySheet(entry, prefill = null) {
       h('dl', { class: 'review' },
         h('div', {}, h('dt', { text: 'Ausgabe' }), h('dd', { text: values.ausgabe.trim() })),
         h('div', {}, h('dt', { text: 'Ort' }), h('dd', { text: values.ort.trim() || '–' })),
-        h('div', { class: 'big' }, h('dt', { text: 'Betrag' }), h('dd', { text: formatEuro(amount) }))),
-      h('p', { class: 'note', text: 'Wird als Ausgabe (negativer Betrag) in deiner Excel-Datei gespeichert.' }),
+        h('div', { class: 'big' }, h('dt', { text: 'Betrag' }), h('dd', { text: refund ? `+${formatEuro(amount)}` : formatEuro(amount) }))),
+      h('p', { class: 'note', text: refund
+        ? 'Wird als Rückerstattung (positiver Betrag) in deiner Excel-Datei gespeichert.'
+        : 'Wird als Ausgabe (negativer Betrag) in deiner Excel-Datei gespeichert.' }),
       errBox,
       h('div', { class: 'actions' }, backBtn, saveBtn),
     );

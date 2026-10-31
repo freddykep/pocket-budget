@@ -100,6 +100,24 @@ test('Ausgabedatei ist eine gueltige Arbeitsmappe (ExcelJS oeffnet sie, Merges v
   assert.equal(ws.getCell('B2').master.address, 'B2');
 });
 
+test('Vorzeichen: Standard negativ, nur refund:true speichert positiv; Update wechselt zurueck', { skip }, async () => {
+  const { io } = fakeDrive();
+  const find = async (id) => (await readSheet(io)).rows.find((e) => e.id === id);
+  await appendRecord(io, { id: 'neg-0001-aaaa', ausgabe: 'A', ort: '', betrag: '10' });
+  await appendRecord(io, { id: 'neg-0002-aaaa', ausgabe: 'B', ort: '', betrag: '-10' });
+  await appendRecord(io, { id: 'pos-0001-aaaa', ausgabe: 'R', ort: '', betrag: '10', refund: true });
+  await appendRecord(io, { id: 'pos-0002-aaaa', ausgabe: 'R2', ort: '', betrag: '-10', refund: true });
+  await appendRecord(io, { id: 'neg-0003-aaaa', ausgabe: 'C', ort: '', betrag: '10', refund: 'true' });
+  assert.equal((await find('neg-0001-aaaa')).betrag, -10);
+  assert.equal((await find('neg-0002-aaaa')).betrag, -10);
+  assert.equal((await find('pos-0001-aaaa')).betrag, 10);
+  assert.equal((await find('pos-0002-aaaa')).betrag, 10);
+  assert.equal((await find('neg-0003-aaaa')).betrag, -10, 'nur das Boolean true zaehlt');
+  const row = await find('pos-0001-aaaa');
+  await updateRecord(io, { id: row.id, expectedHash: row.hash, values: { ausgabe: 'R', ort: '', betrag: 10 } });
+  assert.equal((await find('pos-0001-aaaa')).betrag, -10);
+});
+
 test('append ist idempotent: gleiche ID zweimal -> ein Eintrag', { skip }, async () => {
   const { io, state } = fakeDrive();
   await appendRecord(io, { id: 'dup-0001-aaaa', ausgabe: 'Kaffee', ort: '', betrag: 3 });
