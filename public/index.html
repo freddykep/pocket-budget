@@ -2,176 +2,24 @@
 <html lang="de">
 <head>
 <meta charset="utf-8">
-<meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Pocket Budget – OneDrive PoC</title>
-<style>
-  body { font-family: system-ui, sans-serif; max-width: 52rem; margin: 1.5rem auto; padding: 0 1rem; }
-  section { border: 1px solid #ccc; border-radius: 6px; padding: .75rem 1rem; margin: 1rem 0; }
-  h2 { margin: 0 0 .5rem; font-size: 1.05rem; }
-  table { border-collapse: collapse; width: 100%; }
-  td, th { border: 1px solid #ddd; padding: .25rem .5rem; text-align: left; }
-  button, input { font: inherit; padding: .3rem .6rem; }
-  .err { color: #b00020; } .ok { color: #1b6e2d; } .muted { color: #666; font-size: .9rem; }
-  ul.files { list-style: none; padding: 0; } ul.files li { padding: .15rem 0; }
-  [hidden] { display: none !important; }
-</style>
+<meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+<title>Pocket Budget</title>
+<meta name="description" content="Haushaltsausgaben einfach erfassen – direkt in deiner Excel-Datei.">
+<meta name="theme-color" content="#0F766E">
+<link rel="manifest" href="/manifest.webmanifest">
+<link rel="icon" href="/icons/logo.svg" type="image/svg+xml">
+<link rel="apple-touch-icon" href="/icons/apple-touch-icon.png">
+<meta name="apple-mobile-web-app-capable" content="yes">
+<meta name="mobile-web-app-capable" content="yes">
+<meta name="apple-mobile-web-app-title" content="Pocket Budget">
+<meta name="apple-mobile-web-app-status-bar-style" content="default">
+<link rel="stylesheet" href="/styles.css">
 </head>
 <body>
-<h1>Pocket Budget – OneDrive PoC</h1>
-<p class="muted">Technischer Test der Excel-Anbindung. Nur Dummy-Daten verwenden.</p>
-<div id="status" role="status"></div>
-
-<section id="s-login">
-  <h2>1. Anmeldung</h2>
-  <a href="/api/auth/login"><button type="button">Mit Microsoft OneDrive verbinden</button></a>
-</section>
-
-<section id="s-account" hidden>
-  <h2>Angemeldetes Konto</h2>
-  <div id="account"></div>
-  <button type="button" id="logout">Trennen und abmelden</button>
-</section>
-
-<section id="s-file" hidden>
-  <h2>2. Excel-Datei wählen</h2>
-  <div>Ausgewählt: <strong id="fileName">–</strong></div>
-  <div class="muted" id="path"></div>
-  <ul class="files" id="files"></ul>
-</section>
-
-<section id="s-read" hidden>
-  <h2>3. Auslesen</h2>
-  <button type="button" id="read">Excel-Datei auslesen</button>
-  <div class="muted" id="fileInfo"></div>
-  <table id="table" hidden>
-    <thead><tr><th>Zeile</th><th>ID</th><th>Ausgabentext</th><th>Ort</th><th>Betrag</th><th></th></tr></thead>
-    <tbody></tbody>
-  </table>
-</section>
-
-<section id="s-write" hidden>
-  <h2>4. Testdatensatz</h2>
-  <form id="form">
-    <input name="ausgabentext" placeholder="Ausgabentext" required>
-    <input name="ort" placeholder="Ort (optional)">
-    <input name="betrag" placeholder="Betrag" inputmode="decimal" required>
-    <input type="hidden" name="rid"><input type="hidden" name="rhash">
-    <button type="submit" id="save">Testdatensatz in Excel speichern</button>
-    <button type="button" id="cancel" hidden>Bearbeiten abbrechen</button>
-  </form>
-  <div class="muted" id="mode">Neuer Datensatz</div>
-</section>
-
-<script>
-const $ = (id) => document.getElementById(id);
-const stack = [];
-
-function say(text, cls = '') { const s = $('status'); s.textContent = text; s.className = cls; }
-
-async function api(path, body) {
-  const res = await fetch(path, body === undefined ? {} : {
-    method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body),
-  });
-  const data = await res.json().catch(() => ({}));
-  if (!res.ok) { const e = new Error(data.error?.message || res.statusText); e.code = data.error?.code; e.data = data.error; throw e; }
-  return data;
-}
-
-function fail(e) {
-  if (e.code === 'not_signed_in' || e.code === 'reauth') { show(false); }
-  say(`Fehler: ${e.message}`, 'err');
-}
-
-function show(signedIn) {
-  $('s-login').hidden = signedIn;
-  for (const id of ['s-account', 's-file', 's-read', 's-write']) $(id).hidden = !signedIn;
-}
-
-async function init() {
-  const err = new URLSearchParams(location.search).get('error');
-  if (err) { say(`Anmeldung fehlgeschlagen: ${err}`, 'err'); history.replaceState(null, '', '/'); }
-  try {
-    const me = await api('/api/me');
-    show(true);
-    $('account').textContent = `${me.displayName} (${me.account})`;
-    $('fileName').textContent = me.selectedFile?.name || '–';
-    await browse();
-  } catch (e) { if (e.code !== 'not_signed_in') fail(e); else show(false); }
-}
-
-async function browse() {
-  const folder = stack.at(-1)?.id || '';
-  const { items } = await api('/api/files' + (folder ? `?folder=${encodeURIComponent(folder)}` : ''));
-  $('path').textContent = '/' + stack.map((s) => s.name).join('/');
-  const ul = $('files'); ul.replaceChildren();
-  if (stack.length) addItem(ul, '⬆ ..', () => { stack.pop(); browse().catch(fail); });
-  for (const i of items) {
-    if (i.isFolder) addItem(ul, `📁 ${i.name}`, () => { stack.push({ id: i.id, name: i.name }); browse().catch(fail); });
-    else addItem(ul, `📄 ${i.name}`, () => choose(i.id));
-  }
-}
-
-function addItem(ul, label, onClick) {
-  const li = document.createElement('li');
-  const b = document.createElement('button'); b.type = 'button'; b.textContent = label; b.onclick = onClick;
-  li.append(b); ul.append(li);
-}
-
-async function choose(itemId) {
-  try {
-    const f = await api('/api/file/select', { itemId });
-    $('fileName').textContent = f.name;
-    say(`Datei gewählt: ${f.name} (driveId ${f.driveId}, itemId ${f.itemId})`, 'ok');
-  } catch (e) { fail(e); }
-}
-
-async function readRows() {
-  const d = await api('/api/excel/read');
-  $('fileInfo').textContent = `${d.file.name} · Blatt "${d.sheet}" · ${d.rows.length} Zeilen · eTag ${d.file.etag} · zuletzt geändert ${d.file.lastModified} ${d.file.lastModifiedBy || ''}`;
-  $('table').hidden = false;
-  const tb = $('table').tBodies[0]; tb.replaceChildren();
-  for (const r of d.rows) {
-    const tr = tb.insertRow();
-    for (const v of [r.row, r.id, r.ausgabe, r.ort, r.betrag]) tr.insertCell().textContent = v;
-    const b = document.createElement('button'); b.type = 'button'; b.textContent = 'Ändern';
-    b.onclick = () => edit(r); tr.insertCell().append(b);
-    if (!d.hasId) b.disabled = true;
-  }
-  return d;
-}
-
-function edit(r) {
-  const f = $('form');
-  f.ausgabentext.value = r.ausgabe; f.ort.value = r.ort; f.betrag.value = r.betrag; f.rid.value = r.id; f.rhash.value = r.hash;
-  $('mode').textContent = `Ändere Zeile ${r.row} (ID ${r.id})`; $('cancel').hidden = false;
-}
-function resetForm() { $('form').reset(); $("form").rid.value = ''; $("form").rhash.value = ''; $('mode').textContent = 'Neuer Datensatz'; $('cancel').hidden = true; }
-
-$('read').onclick = () => readRows().then((d) => say(`${d.rows.length} Zeilen gelesen`, 'ok')).catch(fail);
-$('cancel').onclick = resetForm;
-$('logout').onclick = () => api('/api/auth/logout', {}).then(() => { show(false); say('Getrennt.'); }).catch(fail);
-
-$('form').onsubmit = async (ev) => {
-  ev.preventDefault();
-  const f = ev.target;
-  const values = { ausgabentext: f.ausgabentext.value, ort: f.ort.value, betrag: f.betrag.value };
-  try {
-    if (f.rid.value) {
-      const r = await api('/api/excel/update', { id: f.rid.value, expectedHash: f.rhash.value, values });
-      say(`Gespeichert (Wiederholungen wegen paralleler Änderung: ${r.retries}). Lese zur Kontrolle neu ein…`, 'ok');
-    } else {
-      const r = await api('/api/excel/append', values);
-      say(`Gespeichert als Zeile ${r.row}, ID ${r.id} (Wiederholungen wegen paralleler Änderung: ${r.retries}). Lese zur Kontrolle neu ein…`, 'ok');
-    }
-    resetForm();
-    await readRows(); // Kontrolle: Aenderung ist tatsaechlich in der Originaldatei angekommen
-  } catch (e) {
-    fail(e);
-    if (e.code === 'conflict') { say('KONFLIKT: Die Zeile wurde zwischenzeitlich geändert, nichts wurde überschrieben. Bitte neu einlesen.', 'err'); }
-  }
-};
-
-init();
-</script>
+<div id="app" aria-live="polite"></div>
+<dialog id="sheet" aria-modal="true"></dialog>
+<div id="toast" role="status" aria-live="polite"></div>
+<noscript><p class="noscript">Pocket Budget benötigt JavaScript.</p></noscript>
+<script type="module" src="/app.js"></script>
 </body>
 </html>
