@@ -277,13 +277,53 @@ function openEntrySheet(entry, prefill = null) {
         h('span', { text: 'Positiver Betrag (Rückerstattung)' })),
       h('div', { class: 'actions' },
         h('button', { type: 'button', class: 'btn ghost', onclick: closeSheet, text: 'Abbrechen' }),
-        h('button', { type: 'submit', class: 'btn', text: 'Prüfen' })));
+        h('button', { type: 'submit', class: 'btn', text: 'Prüfen' })),
+      isEdit ? h('div', { class: 'danger-zone' },
+        h('button', { type: 'button', class: 'btn ghost block', onclick: showDelete, text: 'Eintrag löschen' })) : null);
     openSheet(
       h('h2', { text: isEdit ? 'Ausgabe ändern' : 'Ausgabe erfassen' }),
       prefill?.note ? h('p', { class: 'note', text: prefill.note }) : null,
       form,
     );
     form.querySelector(errors.ausgabe ? '[name=ausgabe]' : errors.ort ? '[name=ort]' : errors.betrag ? '[name=betrag]' : values.ausgabe ? '[name=betrag]' : '[name=ausgabe]')?.focus();
+  }
+
+  function showDelete() {
+    const errBox = h('div', { class: 'msg-error', role: 'alert', hidden: true });
+    let mode = 'delete';
+    const delBtn = h('button', { class: 'btn danger', text: 'Endgültig löschen', onclick: async () => {
+      if (mode === 'reload') { closeSheet(); await loadData(); return; }
+      delBtn.disabled = backBtn.disabled = true;
+      delBtn.textContent = 'Löscht…';
+      errBox.hidden = true;
+      try {
+        await api('/api/excel/delete', { id, expectedHash: entry.hash });
+        closeSheet();
+        toast('Eintrag gelöscht');
+        await loadData();
+      } catch (e) {
+        if (authExpired(e)) return goLogin(e);
+        errBox.textContent = errorMessage(e);
+        errBox.hidden = false;
+        delBtn.disabled = backBtn.disabled = false;
+        delBtn.textContent = 'Erneut versuchen';
+        if (e.code === 'conflict') {
+          mode = 'reload';
+          delBtn.textContent = 'Aktuelle Daten laden';
+        }
+      }
+    } });
+    const backBtn = h('button', { class: 'btn ghost', onclick: () => showForm(), text: 'Zurück' });
+    openSheet(
+      h('h2', { text: 'Eintrag löschen?' }),
+      h('dl', { class: 'review' },
+        h('div', {}, h('dt', { text: 'Ausgabe' }), h('dd', { text: entry.ausgabe || '–' })),
+        h('div', {}, h('dt', { text: 'Ort' }), h('dd', { text: entry.ort || '–' })),
+        h('div', { class: 'big' }, h('dt', { text: 'Betrag' }), h('dd', { text: displayAmount(entry.betrag) }))),
+      h('p', { class: 'note', text: 'Der Eintrag wird aus deiner Excel-Datei entfernt. Die Einträge darunter rücken eine Zeile nach oben.' }),
+      errBox,
+      h('div', { class: 'actions' }, backBtn, delBtn),
+    );
   }
 
   function showReview(amount) {

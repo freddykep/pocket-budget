@@ -9,6 +9,7 @@ import {
   appendRecord,
   assignMissingIds,
   clearList,
+  deleteRecord,
   readSheet,
   updateRecord,
 } from '../lib/workbook-service.js';
@@ -136,6 +137,47 @@ test('append: parallele Excel-Aenderung zwischen Lesen und Speichern geht nicht 
   const d = await readSheet(io);
   assert.equal(d.rows[0].ort, 'Koeln', 'fremde Aenderung blieb erhalten');
   assert.equal(d.rows.length, 13, 'neue Zeile ist vorhanden');
+});
+
+test('loeschen: Eintrag in der Mitte weg, Rest rueckt auf, Merges bleiben, naechster Eintrag ohne Luecke', { skip }, async () => {
+  const { io, state } = fakeDrive();
+  await assignMissingIds(io);
+  const before = await readSheet(io);
+  const target = before.rows[3];
+  const mergesBefore = merges((await entries(state.buf))[SHEET]);
+  const r = await deleteRecord(io, { id: target.id, expectedHash: target.hash });
+  assert.equal(r.deleted, true);
+  const after = await readSheet(io);
+  assert.equal(after.rows.length, before.rows.length - 1);
+  assert.deepEqual(after.rows.map((e) => e.id), before.rows.filter((e) => e.id !== target.id).map((e) => e.id));
+  assert.deepEqual(after.rows.map((e) => e.betrag), before.rows.filter((e) => e.id !== target.id).map((e) => e.betrag));
+  assert.deepEqual(merges((await entries(state.buf))[SHEET]), mergesBefore, 'verbundene Zellen unveraendert');
+  const a = await appendRecord(io, { ausgabe: 'Neu', ort: '', betrag: 1 });
+  assert.equal(a.row, after.rows.at(-1).row + 1, 'keine Luecke');
+});
+
+test('loeschen: Konflikt bei geaenderter Zeile, idempotent bei fehlender ID', { skip }, async () => {
+  const { io, state } = fakeDrive();
+  await assignMissingIds(io);
+  const row = (await readSheet(io)).rows[0];
+  await assert.rejects(deleteRecord(io, { id: row.id, expectedHash: 'falsch' }), (e) => e.status === 409);
+  assert.equal((await readSheet(io)).rows.length, 12, 'nichts geloescht');
+  await deleteRecord(io, { id: row.id, expectedHash: row.hash });
+  const uploads = state.uploads;
+  const again = await deleteRecord(io, { id: row.id, expectedHash: row.hash });
+  assert.equal(again.deleted, false);
+  assert.equal(state.uploads, uploads, 'kein zweiter Upload');
+});
+
+test('loeschen: letzter Eintrag', { skip }, async () => {
+  const { io } = fakeDrive();
+  await assignMissingIds(io);
+  const rows = (await readSheet(io)).rows;
+  const last = rows.at(-1);
+  await deleteRecord(io, { id: last.id, expectedHash: last.hash });
+  const after = await readSheet(io);
+  assert.equal(after.rows.length, rows.length - 1);
+  assert.ok(!after.rows.some((e) => e.id === last.id));
 });
 
 test('IDs ergaenzen: nur fehlende, vorhandene bleiben, zweiter Lauf aendert nichts', { skip }, async () => {
