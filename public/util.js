@@ -113,3 +113,98 @@ export function parseSpeech(input) {
   }
   return { ausgabe: upper(desc), ort: upper(place), betrag, transcript };
 }
+
+// ---- Mehrere Eintraege in einem Diktat --------------------------------------------------------
+// "Rewe 15 Euro, Edeka 10 Euro" -> zwei Vorschlaege. Getrennt wird an Komma (nicht in Zahlen), Semikolon
+// und Woertern wie "und"/"dann"; ohne Trennzeichen an den Betraegen: endet das Diktat jeweils mit dem Betrag
+// ("Rewe 15 Euro Edeka 10 Euro") oder beginnt es damit ("15 Euro Rewe 10 Euro Edeka").
+
+const MARKED_AMOUNT = /(\d+)\s*komma\s*(\d{1,2})\s*(?:euro|€)|(\d+)\s*(?:euro|€)\s*(\d{1,2})(?!\d)(?!\s*(?:euro|€))(?:\s*cent)?|(\d[\d.,]*)\s*(?:euro|€)/gi;
+const BARE_AMOUNT = /(?<=^|\s)\d+(?:[.,]\d{1,2})?(?=\s|$|,)/g;
+const SEPARATOR = /\s*(?:;|(?<!\d),|,(?!\d))\s*|\s+(und dann|und|dann|außerdem|ausserdem|sowie)\s+/gi;
+const LEADING_FILLER = /^(?:(?:ich habe|ich hab|habe|hab|eine neue ausgabe|neue ausgabe|ausgabe|notiere|für|fuer|noch|erstens|zuerst)\s+)*/i;
+const MAX_VOICE_ENTRIES = 10;
+
+// Betragsstellen eines Textes; Betraege mit "Euro" haben Vorrang vor blossen Zahlen ("3 Brötchen 15 Euro").
+function amountSpans(text) {
+  const spans = (re) => [...text.matchAll(re)].map((m) => ({ start: m.index, end: m.index + m[0].length }));
+  const marked = spans(MARKED_AMOUNT);
+  return marked.length ? marked : spans(BARE_AMOUNT);
+}
+
+function splitPieces(text) {
+  const pieces = [];
+  const seps = [''];
+  let last = 0;
+  for (const m of text.matchAll(SEPARATOR)) {
+    pieces.push(text.slice(last, m.index));
+    seps.push(m[1] ? ` ${m[1]} ` : ' ');
+    last = m.index + m[0].length;
+  }
+  pieces.push(text.slice(last));
+  return { pieces, seps };
+}
+
+// Stuecke ohne Betrag gehoeren zum folgenden (am Ende: zum vorherigen) Stueck: "Brot und Butter 5 Euro".
+function mergeAmountless(pieces, seps) {
+  const out = [];
+  let carry = '';
+  pieces.forEach((p, i) => {
+    const text = carry ? `${carry}${seps[i]}${p}` : p;
+    if (amountSpans(text).length) { out.push(text); carry = ''; } else carry = text;
+  });
+  if (carry) {
+    if (out.length) out[out.length - 1] += ` ${carry}`;
+    else out.push(carry);
+  }
+  return out;
+}
+
+function splitAtAmounts(piece) {
+  const spans = amountSpans(piece);
+  if (spans.length < 2) return [piece];
+  const startsWithAmount = !piece.slice(0, spans[0].start).replace(LEADING_FILLER, '').trim();
+  const cuts = startsWithAmount ? spans.map((s) => s.start) : spans.map((s) => s.end);
+  const parts = [];
+  let from = 0;
+  for (const cut of startsWithAmount ? cuts.slice(1) : cuts.slice(0, -1)) {
+    parts.push(piece.slice(from, cut));
+    from = cut;
+  }
+  parts.push(piece.slice(from));
+  return parts;
+}
+
+export function parseSpeechMulti(input) {
+  const transcript = String(input ?? '').trim();
+  const { pieces, seps } = splitPieces(transcript);
+  const segments = mergeAmountless(pieces, seps).flatMap(splitAtAmounts).slice(0, MAX_VOICE_ENTRIES);
+  const entries = segments.map((s) => parseSpeech(s)).filter((e) => e.ausgabe || e.betrag !== null);
+  return { entries: entries.length ? entries : [parseSpeech(transcript)], transcript };
+}
+
+// ---- Vorschlaege und Dublettenpruefung (nur aus den bereits geladenen Zeilen) ------------------
+
+const norm = (s) => String(s ?? '').trim().toLocaleLowerCase('de-DE');
+
+// Gleicher Text, Ort und Betrag unter den letzten Eintraegen. Die Excel-Datei hat kein Datum, deshalb zaehlt
+// "zuletzt erfasst" statt "am selben Tag". `betrag` ist der Wert mit Vorzeichen, wie er gespeichert wuerde.
+export function findDuplicate(rows, { ausgabe, ort, betrag }, recent = 20) {
+  return rows.slice(-recent).find((r) => norm(r.ausgabe) === norm(ausgabe) && norm(r.ort) === norm(ort)
+    && typeof r.betrag === 'number' && Math.abs(r.betrag - betrag) < 0.005) ?? null;
+}
+
+// Haeufig/zuletzt genutzte Texte und Orte (neueste zuerst) sowie der letzte Ort/Betrag je Ausgabentext.
+export function buildSuggestions(rows, limit = 200) {
+  const ausgabe = new Map();
+  const ort = new Map();
+  const last = new Map();
+  for (const r of [...rows].reverse()) {
+    const a = String(r.ausgabe ?? '').trim();
+    const o = String(r.ort ?? '').trim();
+    if (a && !ausgabe.has(norm(a))) ausgabe.set(norm(a), a);
+    if (o && !ort.has(norm(o))) ort.set(norm(o), o);
+    if (a && !last.has(norm(a)) && typeof r.betrag === 'number') last.set(norm(a), { ort: o, betrag: Math.abs(r.betrag) });
+  }
+  return { ausgabe: [...ausgabe.values()].slice(0, limit), ort: [...ort.values()].slice(0, limit), last };
+}

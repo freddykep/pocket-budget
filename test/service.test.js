@@ -7,6 +7,7 @@ import { decrypt, encrypt } from '../lib/crypto.js';
 import {
   PreconditionFailed,
   appendRecord,
+  appendRecords,
   assignMissingIds,
   clearList,
   deleteRecord,
@@ -117,6 +118,38 @@ test('Vorzeichen: Standard negativ, nur refund:true speichert positiv; Update we
   const row = await find('pos-0001-aaaa');
   await updateRecord(io, { id: row.id, expectedHash: row.hash, values: { ausgabe: 'R', ort: '', betrag: 10 } });
   assert.equal((await find('pos-0001-aaaa')).betrag, -10);
+});
+
+test('append-many: mehrere Eintraege in einem Upload, Vorzeichen je Eintrag, idempotent', { skip }, async () => {
+  const { io, state } = fakeDrive();
+  const records = [
+    { id: 'many-0001-aaaa', ausgabe: 'Rewe', ort: '', betrag: 15 },
+    { id: 'many-0002-aaaa', ausgabe: 'Edeka', ort: 'Bonn', betrag: '10' },
+    { id: 'many-0003-aaaa', ausgabe: 'Erstattung', ort: '', betrag: 5, refund: true },
+  ];
+  const before = state.uploads;
+  const r = await appendRecords(io, { records });
+  assert.equal(r.added, 3);
+  assert.equal(state.uploads, before + 1, 'ein einziger Upload');
+  const d = await readSheet(io);
+  assert.deepEqual(d.rows.slice(-3).map((e) => [e.id, e.ausgabe, e.ort, e.betrag]), [
+    ['many-0001-aaaa', 'Rewe', '', -15], ['many-0002-aaaa', 'Edeka', 'Bonn', -10], ['many-0003-aaaa', 'Erstattung', '', 5]]);
+  assert.deepEqual(d.rows.slice(-3).map((e) => e.row), [d.rows.at(-3).row, d.rows.at(-3).row + 1, d.rows.at(-3).row + 2], 'Zeilen ohne Luecke');
+  const again = await appendRecords(io, { records });
+  assert.equal(again.added, 0);
+  assert.equal(state.uploads, before + 1, 'Wiederholung laedt nichts hoch');
+  assert.equal((await readSheet(io)).rows.length, d.rows.length);
+});
+
+test('append-many: ungueltige Eintraege speichern nichts', { skip }, async () => {
+  const { io, state } = fakeDrive();
+  const uploads = state.uploads;
+  await assert.rejects(appendRecords(io, { records: [{ ausgabe: 'ok', betrag: 1 }, { ausgabe: '', betrag: 1 }] }), (e) => e.status === 422);
+  await assert.rejects(appendRecords(io, { records: [] }), (e) => e.status === 400);
+  await assert.rejects(appendRecords(io, { records: Array.from({ length: 21 }, () => ({ ausgabe: 'x', betrag: 1 })) }), (e) => e.status === 400);
+  await assert.rejects(appendRecords(io, { records: [{ id: 'dup-aaaa-0001', ausgabe: 'a', betrag: 1 }, { id: 'dup-aaaa-0001', ausgabe: 'b', betrag: 1 }] }), (e) => e.code === 'bad_id');
+  assert.equal(state.uploads, uploads);
+  assert.equal((await readSheet(io)).rows.length, 12);
 });
 
 test('append ist idempotent: gleiche ID zweimal -> ein Eintrag', { skip }, async () => {

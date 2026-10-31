@@ -172,3 +172,18 @@ dialog::backdrop { background: rgb(0 0 0 / 45%); }
 
 .check { display: flex; align-items: center; gap: 12px; min-height: 48px; margin: 0 0 6px; cursor: pointer; }
 input[type="checkbox"] { width: 24px; height: 24px; flex: none; accent-color: var(--primary); }
+
+/* Suche, Hinweise, Mehrfach-Erfassung */
+.search {
+  width: 100%; min-height: 48px; margin: 18px 0 0; padding: 0 14px; font: inherit; color: var(--text);
+  background: var(--surface); border: 2px solid transparent; border-radius: 12px; box-shadow: var(--shadow);
+}
+.search:focus { outline: none; border-color: var(--primary); }
+.msg-warn { background: var(--warn-soft); color: var(--warn-text); border-radius: 12px; padding: 12px 14px; margin: 14px 0 0; }
+.toast-action { margin-left: 14px; background: none; border: 0; color: inherit; font: inherit; font-weight: 700; text-decoration: underline; cursor: pointer; padding: 6px 4px; }
+#toast.has-action { pointer-events: auto; }
+.multi-item { border: 1px solid var(--line); border-radius: 14px; padding: 12px 14px 4px; margin: 0 0 12px; }
+.multi-head { display: flex; justify-content: space-between; align-items: center; margin-bottom: 8px; }
+.link-btn.inline { width: auto; padding: 6px 4px; }
+.item.static { cursor: default; }
+.review-list { box-shadow: none; border: 1px solid var(--line); margin-bottom: 8px; }

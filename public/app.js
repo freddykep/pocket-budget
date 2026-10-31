@@ -1,10 +1,10 @@
-import { ApiError, displayAmount, errorMessage, formatEuro, parseAmount, parseSpeech, totalExpenses } from './util.js';
+import { ApiError, buildSuggestions, displayAmount, errorMessage, findDuplicate, formatEuro, parseAmount, parseSpeechMulti, totalExpenses } from './util.js';
 
 const $app = document.getElementById('app');
 const $sheet = document.getElementById('sheet');
 const $toast = document.getElementById('toast');
 
-const state = { me: null, data: null, lastSync: 0, showAll: false, loading: false, loadError: null, homeActive: false };
+const state = { me: null, data: null, lastSync: 0, showAll: false, loading: false, loadError: null, homeActive: false, query: '' };
 const RECENT = 30;
 
 // ---- Hilfsfunktionen -------------------------------------------------------------------------
@@ -24,11 +24,32 @@ function h(tag, props = {}, ...kids) {
 }
 
 let toastTimer;
-function toast(text) {
-  $toast.textContent = text;
+// Mit `action` ({ label, run }) bleibt der Hinweis laenger stehen und bekommt einen Knopf (z. B. "Rückgängig").
+function toast(text, action = null) {
+  $toast.replaceChildren(text, ...(!action ? [] : [h('button', { class: 'toast-action', text: action.label, onclick: () => {
+    $toast.classList.remove('show', 'has-action');
+    action.run();
+  } })]));
+  $toast.classList.toggle('has-action', !!action);
   $toast.classList.add('show');
   clearTimeout(toastTimer);
-  toastTimer = setTimeout(() => $toast.classList.remove('show'), 3500);
+  toastTimer = setTimeout(() => $toast.classList.remove('show', 'has-action'), action ? 8000 : 3500);
+}
+
+// Macht neu erfasste Eintraege rueckgaengig (Loeschen per ID). Der Hash kommt aus den frisch geladenen Daten:
+// Wurde ein Eintrag inzwischen in Excel geaendert, meldet der Server einen Konflikt und loescht nichts.
+async function undoAppend(ids) {
+  try {
+    for (const id of ids) {
+      const row = state.data?.rows.find((r) => r.id === id);
+      if (row) await api('/api/excel/delete', { id, expectedHash: row.hash });
+    }
+    toast(ids.length === 1 ? 'Eintrag entfernt' : 'Einträge entfernt');
+  } catch (e) {
+    if (authExpired(e)) return goLogin(e);
+    toast(errorMessage(e));
+  }
+  await loadData();
 }
 
 async function api(path, body) {
@@ -188,27 +209,57 @@ function paint() {
         h('p', { text: `${d.missingIds} ${d.missingIds === 1 ? 'Eintrag hat' : 'Einträge haben'} noch keine technische ID. Sie wird für Änderungen und den Abgleich gebraucht und in einer zusätzlichen Spalte der Excel-Datei abgelegt.` }),
         h('button', { class: 'btn small', onclick: () => openAssignIds(d.missingIds), text: 'IDs ergänzen' })));
     }
-    nodes.push(h('div', { class: 'section-title', text: 'Zuletzt erfasst' }));
-    if (!d.rows.length) {
-      nodes.push(h('div', { class: 'card empty', text: 'Noch keine Ausgaben. Tippe unten auf „Ausgabe erfassen".' }));
-    } else {
-      const recent = [...d.rows].reverse();
-      const visible = state.showAll ? recent : recent.slice(0, RECENT);
-      const list = h('ul', { class: 'list' });
-      for (const r of visible) {
-        list.append(h('li', {}, h('button', { class: 'item', disabled: !r.id, onclick: () => openEntrySheet(r) },
-          h('div', { class: 'main' },
-            h('div', { class: 'title', text: r.ausgabe || '(ohne Text)' }),
-            r.ort ? h('div', { class: 'sub', text: r.ort }) : null),
-          h('span', { class: 'amount', text: displayAmount(r.betrag) }))));
-      }
-      nodes.push(list);
-      if (recent.length > RECENT) {
-        nodes.push(h('button', { class: 'link-btn', onclick: () => { state.showAll = !state.showAll; paint(); }, text: state.showAll ? 'Weniger anzeigen' : `Alle ${recent.length} anzeigen` }));
-      }
+    if (d.rows.length > SEARCH_FROM || state.query) {
+      nodes.push(h('input', { type: 'search', class: 'search', placeholder: 'Suchen (Text, Ort oder Betrag)', 'aria-label': 'Einträge durchsuchen',
+        autocomplete: 'off', value: state.query, oninput: (ev) => {
+          state.query = ev.target.value;
+          document.getElementById('list-area')?.replaceChildren(...listNodes());
+        } }));
     }
+    nodes.push(h('div', { id: 'list-area' }, ...listNodes()));
   }
   $content.replaceChildren(...nodes.filter(Boolean));
+}
+
+const SEARCH_FROM = 8;
+
+// Liste der Eintraege (neueste zuerst); mit Suchtext werden alle Treffer gezeigt.
+function listNodes() {
+  const d = state.data;
+  const query = state.query.trim().toLocaleLowerCase('de-DE');
+  const newestFirst = [...d.rows].reverse();
+  const matches = query
+    ? newestFirst.filter((r) => `${r.ausgabe} ${r.ort} ${displayAmount(r.betrag)}`.toLocaleLowerCase('de-DE').includes(query))
+    : newestFirst;
+  const nodes = [];
+  if (query) {
+    const sum = matches.reduce((s, r) => s + (typeof r.betrag === 'number' ? r.betrag : 0), 0);
+    nodes.push(h('div', { class: 'section-title', text: `${matches.length} Treffer · ${formatEuro(totalExpenses(sum))}` }));
+  } else {
+    nodes.push(h('div', { class: 'section-title', text: 'Zuletzt erfasst' }));
+  }
+  if (!d.rows.length) {
+    nodes.push(h('div', { class: 'card empty', text: 'Noch keine Ausgaben. Tippe unten auf „Ausgabe erfassen".' }));
+    return nodes;
+  }
+  if (!matches.length) {
+    nodes.push(h('div', { class: 'card empty', text: 'Keine Treffer.' }));
+    return nodes;
+  }
+  const visible = query || state.showAll ? matches : matches.slice(0, RECENT);
+  const list = h('ul', { class: 'list' });
+  for (const r of visible) {
+    list.append(h('li', {}, h('button', { class: 'item', disabled: !r.id, onclick: () => openEntrySheet(r) },
+      h('div', { class: 'main' },
+        h('div', { class: 'title', text: r.ausgabe || '(ohne Text)' }),
+        r.ort ? h('div', { class: 'sub', text: r.ort }) : null),
+      h('span', { class: 'amount', text: displayAmount(r.betrag) }))));
+  }
+  nodes.push(list);
+  if (!query && matches.length > RECENT) {
+    nodes.push(h('button', { class: 'link-btn', onclick: () => { state.showAll = !state.showAll; paint(); }, text: state.showAll ? 'Weniger anzeigen' : `Alle ${matches.length} anzeigen` }));
+  }
+  return nodes;
 }
 
 async function loadData() {
@@ -244,9 +295,20 @@ function openEntrySheet(entry, prefill = null) {
     ort: entry?.ort ?? prefill?.ort ?? '',
     betrag: entry ? String(Math.abs(entry.betrag)).replace('.', ',') : prefill?.betrag ? String(prefill.betrag).replace('.', ',') : '',
   };
+  const sugg = buildSuggestions(state.data?.rows ?? []);
   // Standard: Ausgabe (negativ). Nur die Checkbox macht daraus eine Rückerstattung (positiv).
   let refund = entry ? entry.betrag > 0 : false;
   showForm();
+
+  // Bekannter Ausgabentext: leere Felder Ort und Betrag mit den Werten des letzten gleichen Eintrags vorbelegen.
+  function fillFromHistory(ev) {
+    if (isEdit) return;
+    const last = sugg.last.get(ev.target.value.trim().toLocaleLowerCase('de-DE'));
+    const { ort, betrag } = ev.target.form.elements;
+    if (!last) return;
+    if (!ort.value.trim() && last.ort) ort.value = last.ort;
+    if (!betrag.value.trim()) betrag.value = String(last.betrag).replace('.', ',');
+  }
 
   function showForm(errors = {}) {
     const field = (key, label, attrs) => h('label', { class: `field${errors[key] ? ' invalid' : ''}` },
@@ -269,8 +331,10 @@ function openEntrySheet(entry, prefill = null) {
       if (Object.keys(errs).length) return showForm(errs);
       showReview(amount);
     } },
-      field('ausgabe', 'Ausgabe', { required: true, autocapitalize: 'sentences', enterkeyhint: 'next', placeholder: 'z. B. Wocheneinkauf' }),
-      field('ort', 'Ort / Händler (optional)', { autocapitalize: 'sentences', enterkeyhint: 'next', placeholder: 'z. B. REWE' }),
+      h('datalist', { id: 'dl-ausgabe' }, sugg.ausgabe.map((v) => h('option', { value: v }))),
+      h('datalist', { id: 'dl-ort' }, sugg.ort.map((v) => h('option', { value: v }))),
+      field('ausgabe', 'Ausgabe', { required: true, autocapitalize: 'sentences', enterkeyhint: 'next', placeholder: 'z. B. Wocheneinkauf', list: 'dl-ausgabe', onchange: fillFromHistory }),
+      field('ort', 'Ort / Händler (optional)', { autocapitalize: 'sentences', enterkeyhint: 'next', placeholder: 'z. B. REWE', list: 'dl-ort' }),
       field('betrag', 'Betrag in Euro', { inputmode: 'decimal', enterkeyhint: 'done', placeholder: '0,00' }),
       h('label', { class: 'check' },
         h('input', { type: 'checkbox', name: 'refund', checked: refund }),
@@ -331,6 +395,8 @@ function openEntrySheet(entry, prefill = null) {
     let mode = 'save';
     const saveBtn = h('button', { class: 'btn', text: 'Speichern', onclick: async () => { if (mode === 'save') return save(); closeSheet(); await loadData(); } });
     const backBtn = h('button', { class: 'btn ghost', onclick: () => showForm(), text: 'Zurück' });
+    const dup = isEdit ? null : findDuplicate(state.data?.rows ?? [], { ausgabe: values.ausgabe.trim(), ort: values.ort.trim(), betrag: refund ? amount : -amount });
+    if (dup) saveBtn.textContent = 'Trotzdem speichern';
 
     async function save() {
       saveBtn.disabled = backBtn.disabled = true;
@@ -346,6 +412,8 @@ function openEntrySheet(entry, prefill = null) {
         // Kontrolle: der Eintrag muss nach dem erneuten Einlesen wirklich in der Datei stehen.
         if (!isEdit && state.data && !state.data.rows.some((r) => r.id === id)) {
           toast('Achtung: Der Eintrag wurde in der Datei nicht gefunden. Bitte in Excel prüfen.');
+        } else if (!isEdit) {
+          toast('In Excel gespeichert', { label: 'Rückgängig', run: () => undoAppend([id]) });
         }
       } catch (e) {
         if (authExpired(e)) return goLogin(e);
@@ -373,6 +441,7 @@ function openEntrySheet(entry, prefill = null) {
       h('p', { class: 'note', text: refund
         ? 'Wird als Rückerstattung (positiver Betrag) in deiner Excel-Datei gespeichert.'
         : 'Wird als Ausgabe (negativer Betrag) in deiner Excel-Datei gespeichert.' }),
+      dup ? h('p', { class: 'msg-warn', role: 'status', text: `Achtung: Unter den letzten Einträgen gibt es schon einen gleichen (${dup.ausgabe}${dup.ort ? `, ${dup.ort}` : ''}, ${displayAmount(dup.betrag)}). Doppelt erfassen?` }) : null,
       errBox,
       h('div', { class: 'actions' }, backBtn, saveBtn),
     );
@@ -404,7 +473,7 @@ function openVoiceSheet() {
     );
   }
 
-  const live = h('p', { class: 'transcript', 'aria-live': 'polite', text: 'Tippe auf „Aufnahme starten" und sage zum Beispiel: „Wocheneinkauf bei Rewe 84 Euro 50".' });
+  const live = h('p', { class: 'transcript', 'aria-live': 'polite', text: 'Tippe auf „Aufnahme starten" und sage zum Beispiel: „Wocheneinkauf bei Rewe 84 Euro 50". Mehrere Ausgaben gehen auch: „Rewe 15 Euro, Edeka 10 Euro".' });
   const errBox = h('div', { class: 'msg-error', role: 'alert', hidden: true });
   const start = h('button', { class: 'btn', text: '🎤 Aufnahme starten', onclick: () => listen() });
   let rec = null;
@@ -436,10 +505,11 @@ function openVoiceSheet() {
         if (!failed) { errBox.textContent = SPEECH_ERRORS['no-speech']; errBox.hidden = false; }
         return;
       }
-      const r = parseSpeech(transcript);
+      const r = parseSpeechMulti(transcript);
       closeSheet();
-      // Nur ein Vorschlag: Der Benutzer prüft und bestätigt in den nächsten Schritten.
-      openEntrySheet(null, { ...r, note: `Erkannt: „${r.transcript}". Bitte prüfen und bei Bedarf korrigieren.` });
+      // Nur Vorschläge: Der Benutzer prüft und bestätigt in den nächsten Schritten.
+      if (r.entries.length > 1) return openMultiSheet(r);
+      openEntrySheet(null, { ...r.entries[0], note: `Erkannt: „${r.transcript}". Bitte prüfen und bei Bedarf korrigieren.` });
     };
     try {
       rec.start();
@@ -456,6 +526,117 @@ function openVoiceSheet() {
     h('p', { class: 'note', text: 'Die Spracherkennung läuft über deinen Browser (Chrome: Google, Safari: Apple). Dabei wird die Aufnahme an den Browser-Hersteller gesendet. Pocket Budget speichert keine Aufnahmen und speichert nichts, bevor du es bestätigst.' }),
     h('div', { class: 'actions' }, h('button', { class: 'btn ghost', onclick: () => { rec?.abort(); closeSheet(); }, text: 'Abbrechen' }), start),
   );
+}
+
+// Mehrere Einträge aus einem Diktat: alle bearbeiten, prüfen und gemeinsam in einem Schritt speichern.
+function openMultiSheet({ entries, transcript }) {
+  const items = entries.map((e) => ({
+    rid: crypto.randomUUID(), // eine ID pro Eintrag: Wiederholtes Speichern erzeugt keine Dubletten
+    ausgabe: e.ausgabe, ort: e.ort, betrag: e.betrag ? String(e.betrag).replace('.', ',') : '', refund: false,
+  }));
+  const sugg = buildSuggestions(state.data?.rows ?? []);
+  showItems();
+
+  function showItems(errors = {}) {
+    const rows = items.map((it, i) => {
+      const err = errors[i] || {};
+      const input = (key, label, attrs = {}) => h('label', { class: `field${err[key] ? ' invalid' : ''}` },
+        h('span', { text: label }),
+        h('input', { value: it[key], autocomplete: 'off', oninput: (ev) => { it[key] = ev.target.value; }, ...attrs }),
+        err[key] ? h('div', { class: 'err', role: 'alert', text: err[key] }) : null);
+      return h('div', { class: 'multi-item' },
+        h('div', { class: 'multi-head' },
+          h('strong', { text: `Eintrag ${i + 1}` }),
+          items.length > 1 ? h('button', { type: 'button', class: 'link-btn inline', text: 'Entfernen', onclick: () => { items.splice(i, 1); showItems(); } }) : null),
+        input('ausgabe', 'Ausgabe', { list: 'dl-ausgabe', autocapitalize: 'sentences' }),
+        input('ort', 'Ort / Händler (optional)', { list: 'dl-ort', autocapitalize: 'sentences' }),
+        input('betrag', 'Betrag in Euro', { inputmode: 'decimal', placeholder: '0,00' }),
+        h('label', { class: 'check' },
+          h('input', { type: 'checkbox', checked: it.refund, onchange: (ev) => { it.refund = ev.target.checked; } }),
+          h('span', { text: 'Positiver Betrag (Rückerstattung)' })));
+    });
+    const form = h('form', { novalidate: true, onsubmit: (ev) => {
+      ev.preventDefault();
+      const errs = {};
+      items.forEach((it, i) => {
+        const e = {};
+        if (!it.ausgabe.trim()) e.ausgabe = 'Bitte eine Beschreibung eingeben.';
+        else if (it.ausgabe.length > 200) e.ausgabe = 'Maximal 200 Zeichen.';
+        if (it.ort.length > 100) e.ort = 'Maximal 100 Zeichen.';
+        const amount = parseAmount(it.betrag);
+        if (Number.isNaN(amount)) e.betrag = 'Bitte einen Betrag wie 84,50 eingeben.';
+        else if (amount <= 0) e.betrag = 'Der Betrag muss größer als 0 sein.';
+        if (Object.keys(e).length) errs[i] = e;
+      });
+      if (Object.keys(errs).length) return showItems(errs);
+      showReview();
+    } },
+      h('datalist', { id: 'dl-ausgabe' }, sugg.ausgabe.map((v) => h('option', { value: v }))),
+      h('datalist', { id: 'dl-ort' }, sugg.ort.map((v) => h('option', { value: v }))),
+      rows,
+      h('div', { class: 'actions' },
+        h('button', { type: 'button', class: 'btn ghost', onclick: closeSheet, text: 'Abbrechen' }),
+        h('button', { type: 'submit', class: 'btn', text: 'Prüfen' })));
+    openSheet(
+      h('h2', { text: `${items.length} Ausgaben erkannt` }),
+      h('p', { class: 'note', text: `Erkannt: „${transcript}". Bitte prüfen und bei Bedarf korrigieren.` }),
+      form,
+    );
+  }
+
+  function showReview() {
+    const signed = items.map((it) => (it.refund ? 1 : -1) * parseAmount(it.betrag));
+    const existing = state.data?.rows ?? [];
+    const dupNotes = items.flatMap((it, i) => {
+      const cand = { ausgabe: it.ausgabe.trim(), ort: it.ort.trim(), betrag: signed[i] };
+      const inBatch = items.slice(0, i).some((o, j) => findDuplicate([{ ausgabe: o.ausgabe, ort: o.ort, betrag: signed[j] }], cand));
+      return findDuplicate(existing, cand) || inBatch ? [cand.ausgabe] : [];
+    });
+    const errBox = h('div', { class: 'msg-error', role: 'alert', hidden: true });
+    const backBtn = h('button', { class: 'btn ghost', onclick: () => showItems(), text: 'Zurück' });
+    const saveBtn = h('button', { class: 'btn', text: dupNotes.length ? `Trotzdem ${items.length} speichern` : `Alle ${items.length} speichern`, onclick: save });
+
+    async function save() {
+      saveBtn.disabled = backBtn.disabled = true;
+      saveBtn.textContent = 'Speichert…';
+      errBox.hidden = true;
+      const records = items.map((it, i) => ({ id: it.rid, ausgabe: it.ausgabe.trim(), ort: it.ort.trim(), betrag: Math.abs(signed[i]), refund: it.refund }));
+      try {
+        await api('/api/excel/append-many', { records });
+        closeSheet();
+        toast(`${items.length} Ausgaben in Excel gespeichert`);
+        await loadData();
+        const ids = items.map((it) => it.rid);
+        if (state.data && !ids.every((id) => state.data.rows.some((r) => r.id === id))) {
+          toast('Achtung: Nicht alle Einträge wurden in der Datei gefunden. Bitte in Excel prüfen.');
+        } else {
+          toast(`${items.length} Ausgaben in Excel gespeichert`, { label: 'Rückgängig', run: () => undoAppend(ids) });
+        }
+      } catch (e) {
+        if (authExpired(e)) return goLogin(e);
+        errBox.textContent = `${errorMessage(e)} Erneut speichern ist sicher, es entsteht kein doppelter Eintrag.`;
+        errBox.hidden = false;
+        saveBtn.disabled = backBtn.disabled = false;
+        saveBtn.textContent = 'Erneut speichern';
+      }
+    }
+
+    const list = h('ul', { class: 'list review-list' });
+    items.forEach((it, i) => list.append(h('li', {}, h('div', { class: 'item static' },
+      h('div', { class: 'main' },
+        h('div', { class: 'title', text: it.ausgabe.trim() }),
+        it.ort.trim() ? h('div', { class: 'sub', text: it.ort.trim() }) : null),
+      h('span', { class: 'amount', text: displayAmount(signed[i]) })))));
+    openSheet(
+      h('h2', { text: 'Bitte prüfen' }),
+      list,
+      h('dl', { class: 'review' }, h('div', { class: 'big' }, h('dt', { text: 'Summe' }), h('dd', { text: formatEuro(totalExpenses(signed.reduce((a, b) => a + b, 0))) }))),
+      h('p', { class: 'note', text: 'Wird in einem Schritt in deiner Excel-Datei gespeichert. Ausgaben als negativer, Rückerstattungen als positiver Betrag.' }),
+      dupNotes.length ? h('p', { class: 'msg-warn', role: 'status', text: `Achtung: Gleiche Einträge gibt es schon (${[...new Set(dupNotes)].join(', ')}). Doppelt erfassen?` }) : null,
+      errBox,
+      h('div', { class: 'actions' }, backBtn, saveBtn),
+    );
+  }
 }
 
 // ---- IDs ergänzen ----------------------------------------------------------------------------
