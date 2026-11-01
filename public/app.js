@@ -16,8 +16,7 @@ const favorites = () => sanitizeFavorites(state.data?.favorites?.items);
 async function saveFavorites(next, baseHash) {
   try {
     const r = await api('/api/excel/update', { favorites: next, expectedHash: baseHash });
-    state.data.favorites = r.favorites;
-    paint();
+    if (!applyWrite(r)) { state.data.favorites = r.favorites; paint(); }
     return null;
   } catch (e) {
     if (authExpired(e)) { goLogin(e); return { message: errorMessage(e), auth: true }; }
@@ -61,14 +60,35 @@ async function undoAppend(ids) {
   try {
     for (const id of ids) {
       const row = state.data?.rows.find((r) => r.id === id);
-      if (row) await api('/api/excel/delete', { id, expectedHash: row.hash });
+      if (row) await refreshAfterWrite(await api('/api/excel/delete', { id, expectedHash: row.hash }));
     }
     toast(ids.length === 1 ? 'Eintrag entfernt' : 'Einträge entfernt');
+    return;
   } catch (e) {
     if (authExpired(e)) return goLogin(e);
     toast(errorMessage(e));
   }
   await loadData();
+}
+
+// Nach einer Änderung liefert der Server den neuen Stand gleich mit: Er wird sofort angezeigt, ohne die Datei
+// noch einmal zu lesen. Fehlt er, wird wie früher neu gelesen.
+function applyWrite(r) {
+  if (!r?.state) return false;
+  state.data = r.state;
+  state.lastSync = Date.now();
+  state.loadError = null;
+  paint();
+  return true;
+}
+const refreshAfterWrite = async (r) => { if (!applyWrite(r)) await loadData(); };
+
+// Kontrolle im Hintergrund (blockiert nichts): Neu erfasste Einträge müssen nach erneutem Einlesen in der Datei stehen.
+async function verifyWritten(ids) {
+  await loadData();
+  if (state.data && !ids.every((id) => state.data.rows.some((r) => r.id === id))) {
+    toast('Achtung: Nicht alle Einträge wurden in der Datei gefunden. Bitte in Excel prüfen.');
+  }
 }
 
 async function api(path, body) {
@@ -298,6 +318,9 @@ function listNodes() {
   return nodes;
 }
 
+// Beim Start wird die Excel-Datei schon während der Konto-Abfrage gelesen (spart eine Wartezeit); loadData nutzt diese Anfrage einmalig.
+let prefetched = null;
+
 async function loadData() {
   if (state.loading) return;
   state.loading = true;
@@ -305,7 +328,9 @@ async function loadData() {
   document.getElementById('refresh')?.classList.add('spin');
   if (!state.data) paint();
   try {
-    state.data = await api('/api/excel/read');
+    const request = prefetched ?? api('/api/excel/read');
+    prefetched = null;
+    state.data = await request;
     state.lastSync = Date.now();
   } catch (e) {
     if (authExpired(e)) {
@@ -397,10 +422,10 @@ function openEntrySheet(entry, prefill = null) {
       delBtn.textContent = 'Löscht…';
       errBox.hidden = true;
       try {
-        await api('/api/excel/delete', { id, expectedHash: entry.hash });
+        const r = await api('/api/excel/delete', { id, expectedHash: entry.hash });
         closeSheet();
         toast('Eintrag gelöscht');
-        await loadData();
+        await refreshAfterWrite(r);
       } catch (e) {
         if (authExpired(e)) return goLogin(e);
         errBox.textContent = errorMessage(e);
@@ -440,17 +465,13 @@ function openEntrySheet(entry, prefill = null) {
       errBox.hidden = true;
       const payload = { ausgabe: values.ausgabe.trim(), ort: values.ort.trim(), betrag: amount, refund };
       try {
-        if (isEdit) await api('/api/excel/update', { id, expectedHash: entry.hash, values: payload });
-        else await api('/api/excel/append', { id, ...payload });
+        const r = isEdit
+          ? await api('/api/excel/update', { id, expectedHash: entry.hash, values: payload })
+          : await api('/api/excel/append', { id, ...payload });
         closeSheet();
-        toast('In Excel gespeichert');
-        await loadData();
-        // Kontrolle: der Eintrag muss nach dem erneuten Einlesen wirklich in der Datei stehen.
-        if (!isEdit && state.data && !state.data.rows.some((r) => r.id === id)) {
-          toast('Achtung: Der Eintrag wurde in der Datei nicht gefunden. Bitte in Excel prüfen.');
-        } else if (!isEdit) {
-          toast('In Excel gespeichert', { label: 'Rückgängig', run: () => undoAppend([id]) });
-        }
+        applyWrite(r);
+        toast('In Excel gespeichert', isEdit ? null : { label: 'Rückgängig', run: () => undoAppend([id]) });
+        if (!isEdit) verifyWritten([id]); else if (!r.state) loadData();
       } catch (e) {
         if (authExpired(e)) return goLogin(e);
         let text = errorMessage(e);
@@ -638,16 +659,12 @@ function openMultiSheet({ entries, transcript }) {
       errBox.hidden = true;
       const records = items.map((it, i) => ({ id: it.rid, ausgabe: it.ausgabe.trim(), ort: it.ort.trim(), betrag: Math.abs(signed[i]), refund: it.refund }));
       try {
-        await api('/api/excel/append', { records });
+        const r = await api('/api/excel/append', { records });
         closeSheet();
-        toast(`${items.length} Ausgaben in Excel gespeichert`);
-        await loadData();
         const ids = items.map((it) => it.rid);
-        if (state.data && !ids.every((id) => state.data.rows.some((r) => r.id === id))) {
-          toast('Achtung: Nicht alle Einträge wurden in der Datei gefunden. Bitte in Excel prüfen.');
-        } else {
-          toast(`${items.length} Ausgaben in Excel gespeichert`, { label: 'Rückgängig', run: () => undoAppend(ids) });
-        }
+        applyWrite(r);
+        toast(`${items.length} Ausgaben in Excel gespeichert`, { label: 'Rückgängig', run: () => undoAppend(ids) });
+        verifyWritten(ids);
       } catch (e) {
         if (authExpired(e)) return goLogin(e);
         errBox.textContent = `${errorMessage(e)} Erneut speichern ist sicher, es entsteht kein doppelter Eintrag.`;
@@ -804,7 +821,7 @@ function openAssignIds(count, then) {
       const r = await api('/api/excel/assign-ids', {});
       closeSheet();
       toast(`${r.assigned} ${r.assigned === 1 ? 'ID' : 'IDs'} ergänzt`);
-      await loadData();
+      await refreshAfterWrite(r);
       then?.();
     } catch (e) {
       if (authExpired(e)) return goLogin(e);
@@ -862,7 +879,7 @@ async function openClearSheet() {
       const r = await api('/api/excel/clear', { expectedListHash: d.listHash });
       closeSheet();
       toast(`Excel geleert (${r.cleared} ${r.cleared === 1 ? 'Eintrag' : 'Einträge'})`);
-      await loadData();
+      await refreshAfterWrite(r);
     } catch (e) {
       if (authExpired(e)) return goLogin(e);
       errBox.textContent = errorMessage(e);
@@ -938,13 +955,17 @@ async function boot() {
   const urlError = params.get('error');
   if (urlError) history.replaceState(null, '', '/');
   try {
+    // Gleichzeitig starten: Konto-Abfrage und Lesen der Excel-Datei. Ohne Anmeldung oder Datei wird das Ergebnis verworfen.
+    prefetched = api('/api/excel/read');
+    prefetched.catch(() => {});
     state.me = await api('/api/me');
   } catch (e) {
+    prefetched = null;
     if (e.code === 'not_signed_in') return renderLogin(urlError);
     if (e.code === 'reauth') return renderLogin(errorMessage(e));
     return renderLogin(urlError || errorMessage(e));
   }
-  if (!state.me.selectedFile) return renderFilePicker();
+  if (!state.me.selectedFile) { prefetched = null; return renderFilePicker(); }
   bootHome();
 }
 
