@@ -96,7 +96,7 @@ test('buildSuggestions: eindeutig, neueste zuerst, letzter Ort/Betrag je Text', 
   assert.deepEqual(s.last.get('kaffee'), { ort: 'Neu', betrag: 4.5 });
 });
 
-import { sanitizeFavorites, sameFavorite, validateFavorite } from '../public/util.js';
+import { moveItem, sanitizeFavorites, sameFavorite, validateFavorite } from '../public/util.js';
 
 test('validateFavorite: Betrag optional, Pflichtfeld Ausgabe', () => {
   assert.deepEqual(validateFavorite({ ausgabe: ' Bäcker ', ort: '', betrag: '' }).value, { ausgabe: 'Bäcker', ort: '', betrag: '' });
@@ -117,4 +117,14 @@ test('sanitizeFavorites: verwirft kaputte Eintraege und Dubletten', () => {
 test('sameFavorite: Ausgabe und Ort, ohne Gross-/Kleinschreibung', () => {
   assert.ok(sameFavorite({ ausgabe: 'Rewe', ort: 'Berlin' }, { ausgabe: 'REWE', ort: 'berlin' }));
   assert.ok(!sameFavorite({ ausgabe: 'Rewe', ort: '' }, { ausgabe: 'Rewe', ort: 'Berlin' }));
+});
+
+test('moveItem: verschiebt um eine Position, Grenzen bleiben, Original unveraendert', () => {
+  const l = ['a', 'b', 'c'];
+  assert.deepEqual(moveItem(l, 1, -1), ['b', 'a', 'c']);
+  assert.deepEqual(moveItem(l, 1, 1), ['a', 'c', 'b']);
+  assert.deepEqual(moveItem(l, 0, -1), ['a', 'b', 'c']);
+  assert.deepEqual(moveItem(l, 2, 1), ['a', 'b', 'c']);
+  assert.deepEqual(moveItem(l, 5, -1), ['a', 'b', 'c']);
+  assert.deepEqual(l, ['a', 'b', 'c']);
 });

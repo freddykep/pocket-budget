@@ -200,3 +200,11 @@ input[type="checkbox"] { width: 24px; height: 24px; flex: none; accent-color: va
 .chip-title { font-weight: 600; max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .chip-sub { font-size: 0.8rem; opacity: 0.85; max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
 .chip.ghost { background: transparent; border: 1px dashed var(--line); color: var(--muted); align-items: center; }
+
+/* Favoriten: Reihenfolge */
+.fav-li { display: flex; align-items: center; }
+.fav-li .item { flex: 1; width: auto; min-width: 0; }
+.reorder { display: flex; flex: none; padding-right: 6px; }
+.move { width: 44px; height: 44px; border: 0; border-radius: 10px; background: none; color: var(--primary); font: inherit; font-size: 1rem; cursor: pointer; }
+.move:active:not(:disabled) { background: var(--primary-soft); }
+.move:disabled { opacity: 0.25; cursor: default; }
