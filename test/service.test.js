@@ -12,6 +12,7 @@ import {
   clearList,
   deleteRecord,
   readSheet,
+  saveFavorites,
   updateRecord,
 } from '../lib/workbook-service.js';
 
@@ -375,4 +376,123 @@ test('Layout mit ID hinten und Ausgabe in A:C: lesen, anhaengen, IDs ergaenzen, 
   const sheet2 = (await entries(state.buf))[SHEET];
   assert.deepEqual(merges(sheet2), merges(sheet));
   assert.equal((await readSheet(io)).rows.length, 0);
+});
+
+// ---- Favoriten-Blatt ------------------------------------------------------------------------
+
+const fav = (ausgabe, ort = '', betrag = '') => ({ ausgabe, ort, betrag });
+
+test('Favoriten: Blatt wird angelegt, Liste und Eintraege bleiben unveraendert, Wiederlesen liefert dieselben Werte', { skip }, async () => {
+  const { io, state } = fakeDrive();
+  const before = await entries(state.buf);
+  const d0 = await readSheet(io);
+  assert.deepEqual(d0.favorites, { exists: false, items: [], hash: d0.favorites.hash });
+
+  const items = [fav('Brötchen', 'Bäcker Müller', 6.5), fav('Tanken', 'Aral'), fav('Fish & <Chips>', '', 12)];
+  await saveFavorites(io, { favorites: items, expectedHash: d0.favorites.hash });
+
+  const after = await entries(state.buf);
+  assert.equal(after[SHEET], before[SHEET], 'Erfassungsliste unveraendert');
+  for (const name of Object.keys(before)) {
+    if (!/workbook\.xml(\.rels)?$|Content_Types/.test(name)) assert.equal(after[name], before[name], `${name} unveraendert`);
+  }
+  assert.match(after['xl/workbook.xml'], /<sheet name="Favoriten"/);
+
+  const d1 = await readSheet(io);
+  assert.deepEqual(d1.favorites.items, items);
+  assert.equal(d1.rows.length, d0.rows.length);
+  assert.equal(d1.sheet, d0.sheet);
+
+  const wb = new ExcelJS.Workbook(); await wb.xlsx.load(state.buf);
+  const ws = wb.getWorksheet('Favoriten');
+  assert.deepEqual(ws.getRow(1).values.slice(1), ['Ausgabe', 'Ort', 'Betrag']);
+  assert.equal(ws.getCell('A4').value, 'Fish & <Chips>');
+  assert.equal(ws.getCell('C2').value, 6.5);
+  assert.equal(wb.worksheets.length, 2);
+});
+
+test('Favoriten: aendern, entfernen (Zeilen dahinter werden geleert), Excel-Aenderung wird erkannt', { skip }, async () => {
+  const { io, state } = fakeDrive();
+  const h = (await readSheet(io)).favorites.hash;
+  const a = await saveFavorites(io, { favorites: [fav('A', 'x', 1), fav('B'), fav('C', '', 3)], expectedHash: h });
+  const b = await saveFavorites(io, { favorites: [fav('C', '', 3), fav('A', 'y')], expectedHash: a.favorites.hash });
+  assert.deepEqual((await readSheet(io)).favorites.items, [fav('C', '', 3), fav('A', 'y')]);
+  assert.equal(b.favorites.hash, (await readSheet(io)).favorites.hash);
+
+  const uploads = state.uploads;
+  await saveFavorites(io, { favorites: [fav('C', '', 3), fav('A', 'y')], expectedHash: b.favorites.hash });
+  assert.equal(state.uploads, uploads, 'unveraenderte Liste wird nicht hochgeladen');
+
+  // "Benutzer" aendert das Blatt direkt in Excel -> veralteter Stand wird nicht ueberschrieben.
+  const wb = new ExcelJS.Workbook(); await wb.xlsx.load(state.buf);
+  wb.getWorksheet('Favoriten').getCell('A4').value = 'Von Hand';
+  wb.getWorksheet('Favoriten').getCell('B4').value = 'Excel';
+  state.buf = Buffer.from(await wb.xlsx.writeBuffer()); state.v++;
+  const cur = await readSheet(io);
+  assert.deepEqual(cur.favorites.items.at(-1), fav('Von Hand', 'Excel'), 'Eintrag aus Excel (Shared Strings) wird gelesen');
+  await assert.rejects(saveFavorites(io, { favorites: [fav('X')], expectedHash: b.favorites.hash }), (e) => e.code === 'conflict');
+  assert.equal((await readSheet(io)).favorites.items.length, 3);
+  await saveFavorites(io, { favorites: [], expectedHash: cur.favorites.hash });
+  assert.deepEqual((await readSheet(io)).favorites.items, []);
+});
+
+test('Favoriten: parallele Aenderung der Erfassungsliste zwischen Lesen und Speichern geht nicht verloren', { skip }, async () => {
+  const { io, state } = fakeDrive();
+  const d = await readSheet(io);
+  state.beforeUpload = () => state.externalEdit((ws) => { ws.getCell('H20').value = 'Notiz'; });
+  await saveFavorites(io, { favorites: [fav('Brot')], expectedHash: d.favorites.hash });
+  const wb = new ExcelJS.Workbook(); await wb.xlsx.load(state.buf);
+  assert.equal(wb.worksheets[0].getCell('H20').value, 'Notiz');
+  assert.deepEqual((await readSheet(io)).favorites.items, [fav('Brot')]);
+});
+
+test('Favoriten: ungueltige Eingaben speichern nichts', { skip }, async () => {
+  const { io, state } = fakeDrive();
+  const h = (await readSheet(io)).favorites.hash;
+  for (const bad of [[fav('')], [{ ausgabe: 'x', ort: '', betrag: 'abc' }], [fav('x', '', 0)], [fav('x', '', -2)], [fav('a'.repeat(201))], [fav('Rewe', 'A'), fav('REWE', 'a')]]) {
+    await assert.rejects(saveFavorites(io, { favorites: bad, expectedHash: h }), (e) => e.status === 422);
+  }
+  await assert.rejects(saveFavorites(io, { favorites: Array.from({ length: 31 }, (_, i) => fav(`F${i}`)), expectedHash: h }), (e) => e.status === 400);
+  await assert.rejects(saveFavorites(io, { favorites: 'x', expectedHash: h }), (e) => e.status === 400);
+  await assert.rejects(saveFavorites(io, { favorites: [], expectedHash: '' }), (e) => e.status === 400);
+  assert.equal(state.uploads, 0);
+});
+
+test('Favoriten-Blatt stoert Loeschen und "Excel leeren" nicht und bleibt dabei erhalten', { skip }, async () => {
+  const { io } = fakeDrive();
+  await assignMissingIds(io);
+  await saveFavorites(io, { favorites: [fav('Brot', 'Lidl', 2)], expectedHash: (await readSheet(io)).favorites.hash });
+  const d = await readSheet(io);
+  await deleteRecord(io, { id: d.rows[0].id, expectedHash: d.rows[0].hash });
+  const d2 = await readSheet(io);
+  assert.equal(d2.rows.length, d.rows.length - 1);
+  await clearList(io, { expectedListHash: d2.listHash });
+  const d3 = await readSheet(io);
+  assert.equal(d3.rows.length, 0);
+  assert.deepEqual(d3.favorites.items, [fav('Brot', 'Lidl', 2)]);
+  await appendRecord(io, { ausgabe: 'Neu', betrag: 1 });
+  assert.equal((await readSheet(io)).rows.length, 1);
+});
+
+test('Favoriten: Blatt vor der Liste wird nicht mit der Liste verwechselt; kaputtes Blatt blockiert nichts', async () => {
+  const wb = new ExcelJS.Workbook();
+  wb.addWorksheet('Favoriten').addRow(['Foo']);
+  wb.addWorksheet('Liste').addRow(['ID', 'Ausgabe', 'Betrag']);
+  const { io } = fakeDrive(Buffer.from(await wb.xlsx.writeBuffer()));
+  const d = await readSheet(io);
+  assert.equal(d.sheet, 'Liste');
+  assert.equal(d.favorites.broken, true);
+  await appendRecord(io, { ausgabe: 'Brot', betrag: 2 });
+  await assert.rejects(saveFavorites(io, { favorites: [fav('X')], expectedHash: d.favorites.hash }), (e) => e.code === 'bad_layout');
+  assert.equal((await readSheet(io)).rows.length, 1);
+});
+
+test('Favoriten: Layout mit ID hinten, ohne Fixture-Datei; Leeren laesst das Favoriten-Blatt stehen', async () => {
+  const { io } = fakeDrive(await backIdFixture());
+  const d = await readSheet(io);
+  await saveFavorites(io, { favorites: [fav('Kaffee', '', 4.2)], expectedHash: d.favorites.hash });
+  await assignMissingIds(io);
+  const d2 = await readSheet(io);
+  await clearList(io, { expectedListHash: d2.listHash });
+  assert.deepEqual((await readSheet(io)).favorites.items, [fav('Kaffee', '', 4.2)]);
 });

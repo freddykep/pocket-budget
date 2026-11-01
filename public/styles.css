@@ -187,3 +187,16 @@ input[type="checkbox"] { width: 24px; height: 24px; flex: none; accent-color: va
 .link-btn.inline { width: auto; padding: 6px 4px; }
 .item.static { cursor: default; }
 .review-list { box-shadow: none; border: 1px solid var(--line); margin-bottom: 8px; }
+
+/* Favoriten */
+.fav-row { display: flex; gap: 8px; overflow-x: auto; padding: 2px 2px 8px; margin: 0 -2px; scrollbar-width: none; }
+.fav-row::-webkit-scrollbar { display: none; }
+.chip {
+  flex: none; display: flex; flex-direction: column; align-items: flex-start; justify-content: center; gap: 1px; max-width: 220px;
+  min-height: 52px; padding: 8px 14px; border: 0; border-radius: 14px; font: inherit; text-align: left; cursor: pointer;
+  background: var(--primary-soft); color: var(--primary);
+}
+.chip:active { filter: brightness(0.92); }
+.chip-title { font-weight: 600; max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.chip-sub { font-size: 0.8rem; opacity: 0.85; max-width: 100%; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.chip.ghost { background: transparent; border: 1px dashed var(--line); color: var(--muted); align-items: center; }

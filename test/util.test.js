@@ -95,3 +95,26 @@ test('buildSuggestions: eindeutig, neueste zuerst, letzter Ort/Betrag je Text', 
   assert.deepEqual(s.ort, ['Neu', 'Bonn', 'Alt']);
   assert.deepEqual(s.last.get('kaffee'), { ort: 'Neu', betrag: 4.5 });
 });
+
+import { sanitizeFavorites, sameFavorite, validateFavorite } from '../public/util.js';
+
+test('validateFavorite: Betrag optional, Pflichtfeld Ausgabe', () => {
+  assert.deepEqual(validateFavorite({ ausgabe: ' Bäcker ', ort: '', betrag: '' }).value, { ausgabe: 'Bäcker', ort: '', betrag: '' });
+  assert.equal(validateFavorite({ ausgabe: 'Tanken', ort: 'Aral', betrag: '65,50' }).value.betrag, 65.5);
+  assert.ok(validateFavorite({ ausgabe: '  ' }).errors.ausgabe);
+  assert.ok(validateFavorite({ ausgabe: 'X', betrag: 'abc' }).errors.betrag);
+  assert.ok(validateFavorite({ ausgabe: 'X', betrag: '0' }).errors.betrag);
+  assert.ok(validateFavorite({ ausgabe: 'X', ort: 'o'.repeat(101) }).errors.ort);
+});
+
+test('sanitizeFavorites: verwirft kaputte Eintraege und Dubletten', () => {
+  assert.deepEqual(sanitizeFavorites('kaputt'), []);
+  assert.deepEqual(sanitizeFavorites(undefined), []);
+  const r = sanitizeFavorites([{ ausgabe: 'Rewe', ort: 'Berlin', betrag: 12 }, { ausgabe: 'REWE', ort: 'berlin' }, { ausgabe: 'Brot', betrag: '' }, null, { ausgabe: '' }, { ort: 'x' }]);
+  assert.deepEqual(r, [{ ausgabe: 'Rewe', ort: 'Berlin', betrag: 12 }, { ausgabe: 'Brot', ort: '', betrag: '' }]);
+});
+
+test('sameFavorite: Ausgabe und Ort, ohne Gross-/Kleinschreibung', () => {
+  assert.ok(sameFavorite({ ausgabe: 'Rewe', ort: 'Berlin' }, { ausgabe: 'REWE', ort: 'berlin' }));
+  assert.ok(!sameFavorite({ ausgabe: 'Rewe', ort: '' }, { ausgabe: 'Rewe', ort: 'Berlin' }));
+});
