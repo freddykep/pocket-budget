@@ -1,4 +1,4 @@
-import { ApiError, buildSuggestions, displayAmount, errorMessage, findDuplicate, formatEuro, parseAmount, parseSpeechMulti, totalExpenses } from './util.js';
+import { ApiError, MAX_FAVORITES, buildSuggestions, displayAmount, errorMessage, findDuplicate, formatEuro, parseAmount, parseSpeechMulti, sameFavorite, sanitizeFavorites, totalExpenses, validateFavorite } from './util.js';
 
 const $app = document.getElementById('app');
 const $sheet = document.getElementById('sheet');
@@ -6,6 +6,25 @@ const $toast = document.getElementById('toast');
 
 const state = { me: null, data: null, lastSync: 0, showAll: false, loading: false, loadError: null, homeActive: false, query: '' };
 const RECENT = 30;
+
+// ---- Favoriten: liegen im Blatt "Favoriten" der Excel-Datei (kommen mit /api/excel/read) ------------
+
+const favorites = () => sanitizeFavorites(state.data?.favorites?.items);
+
+// Speichert die komplette Liste auf Basis des Stands `baseHash`, den der Benutzer gesehen hat (so wird nichts aus Excel überschrieben).
+// Gibt null bei Erfolg zurück, sonst { message, conflict }.
+async function saveFavorites(next, baseHash) {
+  try {
+    const r = await api('/api/excel/update', { favorites: next, expectedHash: baseHash });
+    state.data.favorites = r.favorites;
+    paint();
+    return null;
+  } catch (e) {
+    if (authExpired(e)) { goLogin(e); return { message: errorMessage(e), auth: true }; }
+    if (e.code === 'conflict') await loadData(); // in Excel geänderte Favoriten übernehmen
+    return { message: errorMessage(e), conflict: e.code === 'conflict' };
+  }
+}
 
 // ---- Hilfsfunktionen -------------------------------------------------------------------------
 
@@ -204,6 +223,7 @@ function paint() {
         h('div', { class: 'total', text: formatEuro(totalExpenses(d.summary.total)) }),
         h('div', { class: 'meta', text: `${d.summary.count} ${d.summary.count === 1 ? 'Ausgabe' : 'Ausgaben'} · Stand ${time(state.lastSync)}` })),
     );
+    nodes.push(favoritesNode());
     if (d.missingIds > 0) {
       nodes.push(h('div', { class: 'card banner' },
         h('p', { text: `${d.missingIds} ${d.missingIds === 1 ? 'Eintrag hat' : 'Einträge haben'} noch keine technische ID. Sie wird für Änderungen und den Abgleich gebraucht und in einer zusätzlichen Spalte der Excel-Datei abgelegt.` }),
@@ -222,6 +242,22 @@ function paint() {
 }
 
 const SEARCH_FROM = 8;
+
+// Schnellwahl: Tippen auf einen Favoriten öffnet das Formular vorbefüllt; geprüft und bestätigt wird weiterhin.
+function favoritesNode() {
+  const favs = favorites();
+  if (!favs.length) {
+    return h('button', { class: 'link-btn', onclick: () => openFavorites(), text: '☆ Favoriten für schnelleres Erfassen hinterlegen' });
+  }
+  return h('div', {},
+    h('div', { class: 'section-title', text: 'Favoriten' }),
+    h('div', { class: 'fav-row' },
+      favs.map((f) => h('button', { class: 'chip', onclick: () => openEntrySheet(null, { ausgabe: f.ausgabe, ort: f.ort, betrag: f.betrag }),
+        'aria-label': `Favorit ${f.ausgabe}${f.ort ? ` bei ${f.ort}` : ''}${f.betrag ? `, ${formatEuro(f.betrag)}` : ''} erfassen` },
+        h('span', { class: 'chip-title', text: f.ausgabe }),
+        f.ort || f.betrag ? h('span', { class: 'chip-sub', text: [f.ort, f.betrag ? formatEuro(f.betrag) : ''].filter(Boolean).join(' · ') }) : null)),
+      h('button', { class: 'chip ghost', onclick: () => openFavorites(), 'aria-label': 'Favoriten verwalten', text: '✎ Verwalten' })));
+}
 
 // Liste der Eintraege (neueste zuerst); mit Suchtext werden alle Treffer gezeigt.
 function listNodes() {
@@ -639,6 +675,99 @@ function openMultiSheet({ entries, transcript }) {
   }
 }
 
+// ---- Favoriten verwalten -------------------------------------------------------------------
+
+function openFavorites() {
+  if (!state.data) return toast('Bitte warten, bis die Excel-Datei geladen ist.');
+  if (state.data.favorites?.broken) {
+    return openSheet(
+      h('h2', { text: 'Favoriten' }),
+      h('div', { class: 'msg-error', role: 'alert', text: 'Im Blatt „Favoriten" deiner Excel-Datei fehlen die Spalten Ausgabe, Ort und Betrag in Zeile 1. Bitte in Excel korrigieren; es wurde nichts verändert.' }),
+      h('div', { class: 'actions' }, h('button', { class: 'btn', onclick: closeSheet, text: 'Schließen' })));
+  }
+  const favs = favorites();
+  const list = h('ul', { class: 'list' });
+  favs.forEach((f, i) => {
+    list.append(h('li', {}, h('button', { class: 'item', onclick: () => openFavoriteForm(i), 'aria-label': `Favorit ${f.ausgabe} bearbeiten` },
+      h('div', { class: 'main' },
+        h('div', { class: 'title', text: f.ausgabe }),
+        f.ort ? h('div', { class: 'sub', text: f.ort }) : null),
+      h('span', { class: 'amount', text: f.betrag ? formatEuro(f.betrag) : '–' }))));
+  });
+  openSheet(
+    h('h2', { text: 'Favoriten' }),
+    favs.length ? list : h('p', { class: 'note', text: 'Noch keine Favoriten. Lege häufige Ausgaben an, zum Beispiel „Brötchen, Bäcker Müller, 6,50". Sie erscheinen dann auf der Startseite und füllen das Formular mit einem Tipp vor.' }),
+    h('p', { class: 'note', text: 'Die Favoriten stehen im Tabellenblatt „Favoriten" deiner Excel-Datei (Spalten Ausgabe, Ort, Betrag). Sie gelten auf allen Geräten und lassen sich dort auch direkt bearbeiten.' }),
+    h('div', { class: 'actions' },
+      h('button', { class: 'btn ghost', onclick: closeSheet, text: 'Schließen' }),
+      h('button', { class: 'btn', disabled: favs.length >= MAX_FAVORITES, onclick: () => openFavoriteForm(null), text: '＋ Neu' })),
+  );
+}
+
+// index: Position in der Liste (Ändern) oder null (Neu).
+function openFavoriteForm(index, errors = {}, draft = null, serverError = '') {
+  const favs = favorites();
+  const fav = index == null ? null : favs[index];
+  const isEdit = !!fav;
+  const values = draft ?? { ausgabe: fav?.ausgabe ?? '', ort: fav?.ort ?? '', betrag: fav?.betrag ? String(fav.betrag).replace('.', ',') : '' };
+  const baseHash = state.data.favorites.hash;
+  const sugg = buildSuggestions(state.data?.rows ?? []);
+  const field = (key, label, attrs) => h('label', { class: `field${errors[key] ? ' invalid' : ''}` },
+    h('span', { text: label }),
+    h('input', { name: key, value: values[key], autocomplete: 'off', ...attrs }),
+    errors[key] ? h('div', { class: 'err', role: 'alert', text: errors[key] }) : null);
+  const errBox = h('div', { class: 'msg-error', role: 'alert', hidden: !serverError, text: serverError });
+  const backBtn = h('button', { type: 'button', class: 'btn ghost', onclick: () => openFavorites(), text: 'Zurück' });
+  const saveBtn = h('button', { type: 'submit', class: 'btn', text: 'Speichern' });
+  const delBtn = isEdit ? h('button', { type: 'button', class: 'btn ghost block', text: 'Favorit löschen' }) : null;
+
+  // Ein Speichervorgang für Ändern, Neu und Löschen: sperrt die Knöpfe, zeigt Fehler im Formular.
+  async function commit(next, done) {
+    const buttons = [backBtn, saveBtn, delBtn].filter(Boolean);
+    buttons.forEach((b) => { b.disabled = true; });
+    const label = saveBtn.textContent;
+    saveBtn.textContent = 'Speichert…';
+    errBox.hidden = true;
+    const err = await saveFavorites(next, baseHash);
+    if (!err) return done();
+    if (err.auth) return;
+    errBox.textContent = err.message;
+    errBox.hidden = false;
+    buttons.forEach((b) => { b.disabled = false; });
+    saveBtn.textContent = label;
+    if (err.conflict) {
+      // Die Liste hat sich geändert: Nur noch zur aktuellen Liste zurück, kein erneutes Speichern mit altem Stand.
+      saveBtn.type = 'button';
+      saveBtn.textContent = 'Aktuelle Liste laden';
+      saveBtn.onclick = () => openFavorites();
+      if (delBtn) delBtn.hidden = true;
+    }
+  }
+
+  const form = h('form', { novalidate: true, onsubmit: (ev) => {
+    ev.preventDefault();
+    const fd = new FormData(ev.target);
+    const input = { ausgabe: String(fd.get('ausgabe') ?? ''), ort: String(fd.get('ort') ?? ''), betrag: String(fd.get('betrag') ?? '') };
+    const r = validateFavorite(input);
+    if (r.errors) return openFavoriteForm(index, r.errors, input);
+    if (favs.some((o, i) => i !== index && sameFavorite(o, r.value))) return openFavoriteForm(index, { ausgabe: 'Diesen Favoriten gibt es schon.' }, input);
+    if (!isEdit && favs.length >= MAX_FAVORITES) return openFavoriteForm(index, { ausgabe: `Maximal ${MAX_FAVORITES} Favoriten.` }, input);
+    const next = isEdit ? favs.map((o, i) => (i === index ? r.value : o)) : [...favs, r.value];
+    commit(next, () => { toast('Favorit gespeichert'); openFavorites(); });
+  } },
+    h('datalist', { id: 'dl-ausgabe' }, sugg.ausgabe.map((v) => h('option', { value: v }))),
+    h('datalist', { id: 'dl-ort' }, sugg.ort.map((v) => h('option', { value: v }))),
+    field('ausgabe', 'Ausgabe', { required: true, autocapitalize: 'sentences', enterkeyhint: 'next', placeholder: 'z. B. Brötchen', list: 'dl-ausgabe' }),
+    field('ort', 'Ort / Händler (optional)', { autocapitalize: 'sentences', enterkeyhint: 'next', placeholder: 'z. B. Bäcker Müller', list: 'dl-ort' }),
+    field('betrag', 'Betrag in Euro (optional)', { inputmode: 'decimal', enterkeyhint: 'done', placeholder: 'leer = beim Erfassen eintippen' }),
+    errBox,
+    h('div', { class: 'actions' }, backBtn, saveBtn),
+    isEdit ? h('div', { class: 'danger-zone' }, delBtn) : null);
+  delBtn?.addEventListener('click', () => commit(favs.filter((_, i) => i !== index), () => { toast('Favorit gelöscht'); openFavorites(); }));
+  openSheet(h('h2', { text: isEdit ? 'Favorit ändern' : 'Neuer Favorit' }), form);
+  form.querySelector(errors.betrag ? '[name=betrag]' : errors.ort ? '[name=ort]' : '[name=ausgabe]')?.focus();
+}
+
 // ---- IDs ergänzen ----------------------------------------------------------------------------
 
 function openAssignIds(count, then) {
@@ -745,6 +874,7 @@ function openSettings() {
       h('div', {}, h('dt', { text: 'Microsoft-Konto' }), h('dd', { text: `${me.displayName ?? ''} (${me.account ?? ''})` })),
       h('div', {}, h('dt', { text: 'Excel-Datei' }), h('dd', { text: me.selectedFile?.name ?? '–' }))),
     h('div', { class: 'stack' },
+      h('button', { class: 'btn secondary', onclick: openFavorites, text: '☆ Favoriten verwalten' }),
       h('button', { class: 'btn secondary', onclick: () => { closeSheet(); renderFilePicker(); }, text: 'Andere Datei wählen' }),
       h('button', { class: 'btn ghost', onclick: openDisconnect, text: 'Verbindung trennen' })),
     h('div', { class: 'danger-zone' },

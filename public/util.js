@@ -208,3 +208,43 @@ export function buildSuggestions(rows, limit = 200) {
   }
   return { ausgabe: [...ausgabe.values()].slice(0, limit), ort: [...ort.values()].slice(0, limit), last };
 }
+
+// ---- Favoriten: manuell hinterlegte Vorlagen (Ausgabe, Ort, optional Betrag) -------------------
+
+export const MAX_FAVORITES = 30;
+
+// Prueft eine Favoriten-Eingabe. Liefert { value } oder { errors }. Betrag ist optional (leer = beim Erfassen eintippen).
+export function validateFavorite({ ausgabe = '', ort = '', betrag = '' } = {}) {
+  const errors = {};
+  const a = String(ausgabe).trim();
+  const o = String(ort).trim();
+  const b = String(betrag).trim();
+  if (!a) errors.ausgabe = 'Bitte eine Beschreibung eingeben.';
+  else if (a.length > 200) errors.ausgabe = 'Maximal 200 Zeichen.';
+  if (o.length > 100) errors.ort = 'Maximal 100 Zeichen.';
+  let amount = '';
+  if (b) {
+    const n = parseAmount(b);
+    if (Number.isNaN(n) || n <= 0) errors.betrag = 'Bitte einen Betrag wie 84,50 eingeben oder das Feld leer lassen.';
+    else amount = n;
+  }
+  return Object.keys(errors).length ? { errors } : { value: { ausgabe: a, ort: o, betrag: amount } };
+}
+
+// Liest die Favoriten aus der Excel-Datei defensiv ein (von Hand bearbeitete Zeilen koennen unvollstaendig sein).
+export function sanitizeFavorites(raw) {
+  if (!Array.isArray(raw)) return [];
+  const out = [];
+  for (const f of raw) {
+    if (!f || typeof f !== 'object') continue;
+    const v = validateFavorite({ ausgabe: f.ausgabe, ort: f.ort, betrag: typeof f.betrag === 'number' ? String(f.betrag) : '' });
+    if (v.value && !out.some((o) => sameFavorite(o, v.value))) out.push(v.value);
+  }
+  return out.slice(0, MAX_FAVORITES);
+}
+
+// Gleicher Favorit = gleiche Ausgabe und gleicher Ort (ohne Beachtung von Gross-/Kleinschreibung).
+export function sameFavorite(a, b) {
+  const k = (f) => `${f.ausgabe}\u0000${f.ort}`.toLocaleLowerCase('de-DE');
+  return k(a) === k(b);
+}

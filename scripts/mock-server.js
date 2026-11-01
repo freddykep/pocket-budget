@@ -5,7 +5,7 @@ import { readFileSync } from 'node:fs';
 import { createServer } from 'node:http';
 import { extname, join } from 'node:path';
 import { HttpError, readJson, send, wrap } from '../lib/http.js';
-import { PreconditionFailed, appendRecord, appendRecords, assignMissingIds, clearList, deleteRecord, readSheet, updateRecord } from '../lib/workbook-service.js';
+import { PreconditionFailed, appendRecord, appendRecords, assignMissingIds, clearList, deleteRecord, readSheet, saveFavorites, updateRecord } from '../lib/workbook-service.js';
 
 const publicDir = join(import.meta.dirname, '..', 'public');
 const fixture = process.env.FIXTURE || join(import.meta.dirname, '..', 'testdata', 'test.xlsx');
@@ -28,7 +28,7 @@ const routes = {
   '/api/file/select': async () => { drive.hasFile = true; return { name: 'test.xlsx' }; },
   '/api/excel/read': () => readSheet(io),
   '/api/excel/append': async (req) => { const b = await readJson(req); return Array.isArray(b.records) ? appendRecords(io, b) : appendRecord(io, b); },
-  '/api/excel/update': async (req) => updateRecord(io, await readJson(req)),
+  '/api/excel/update': async (req) => { const b = await readJson(req); return Array.isArray(b.favorites) ? saveFavorites(io, b) : updateRecord(io, b); },
   '/api/excel/delete': async (req) => deleteRecord(io, await readJson(req)),
   '/api/excel/clear': async (req) => clearList(io, await readJson(req)),
   '/api/excel/assign-ids': () => assignMissingIds(io),
