@@ -6,8 +6,8 @@ import { store } from '../lib/store.js';
 export default wrap(async (req, res) => {
   method(req, 'GET');
   const userId = await requireUser(req);
-  const me = await getMe(userId);
-  const file = await store.get('files', userId);
+  // Konto (Microsoft) und gewaehlte Datei (Store) sind unabhaengig: gleichzeitig abfragen.
+  const [me, file] = await Promise.all([getMe(userId), store.get('files', userId)]);
   send(res, 200, {
     displayName: me.displayName,
     account: me.mail || me.userPrincipalName,

@@ -496,3 +496,58 @@ test('Favoriten: Layout mit ID hinten, ohne Fixture-Datei; Leeren laesst das Fav
   await clearList(io, { expectedListHash: d2.listHash });
   assert.deepEqual((await readSheet(io)).favorites.items, [fav('Kaffee', '', 4.2)]);
 });
+
+// ---- Performance: Antwort enthaelt den neuen Stand, Lesen/Schreiben brauchen wenige Aufrufe ----
+
+const sameState = (state, fresh) => {
+  assert.ok(state, 'Antwort enthaelt den Stand');
+  for (const k of ['sheet', 'rows', 'summary', 'missingIds', 'listHash', 'favorites']) assert.deepEqual(state[k], fresh[k], k);
+};
+
+test('Antwort jeder Aenderung enthaelt den Stand, der einem frischen Lesen entspricht', { skip }, async () => {
+  const { io } = fakeDrive();
+  let r = await assignMissingIds(io);
+  sameState(r.state, await readSheet(io));
+
+  r = await appendRecord(io, { ausgabe: 'Brot', ort: 'Lidl', betrag: 2.5 });
+  sameState(r.state, await readSheet(io));
+  const again = await appendRecord(io, { id: r.id, ausgabe: 'Brot', ort: 'Lidl', betrag: 2.5 });
+  assert.equal(again.duplicate, true);
+  sameState(again.state, await readSheet(io));
+
+  r = await appendRecords(io, { records: [{ ausgabe: 'A', betrag: 1 }, { ausgabe: 'B', ort: 'x', betrag: 2, refund: true }] });
+  sameState(r.state, await readSheet(io));
+
+  const d = await readSheet(io);
+  const last = d.rows.at(-1);
+  r = await updateRecord(io, { id: last.id, expectedHash: last.hash, values: { ausgabe: 'B2', ort: 'y', betrag: 3 } });
+  sameState(r.state, await readSheet(io));
+
+  const d2 = await readSheet(io);
+  r = await deleteRecord(io, { id: d2.rows[2].id, expectedHash: d2.rows[2].hash });
+  sameState(r.state, await readSheet(io));
+
+  r = await saveFavorites(io, { favorites: [fav('Brot', 'Lidl', 2)], expectedHash: (await readSheet(io)).favorites.hash });
+  sameState(r.state, await readSheet(io));
+  assert.deepEqual(r.state.favorites, r.favorites);
+
+  const d3 = await readSheet(io);
+  r = await clearList(io, { expectedListHash: d3.listHash });
+  sameState(r.state, await readSheet(io));
+  assert.equal(r.state.rows.length, 0);
+});
+
+test('Aufrufe pro Vorgang: Lesen 1 Runde (parallel), Aendern Metadaten, Inhalt, Upload', { skip }, async () => {
+  const { io } = fakeDrive();
+  const calls = [];
+  const traced = {
+    meta: async () => { calls.push('meta'); return io.meta(); },
+    download: async () => { calls.push('download'); return io.download(); },
+    upload: async (b, e) => { calls.push('upload'); return io.upload(b, e); },
+  };
+  await readSheet(traced);
+  assert.deepEqual([...calls].sort(), ['download', 'meta']);
+  calls.length = 0;
+  await appendRecord(traced, { ausgabe: 'X', betrag: 1 });
+  assert.deepEqual(calls, ['meta', 'download', 'upload']);
+});
