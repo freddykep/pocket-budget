@@ -243,6 +243,15 @@ export function sanitizeFavorites(raw) {
   return out.slice(0, MAX_FAVORITES);
 }
 
+// Neue Liste mit dem Element an Position `index` um `delta` verschoben (Grenzen werden nicht ueberschritten).
+export function moveItem(list, index, delta) {
+  const to = index + delta;
+  if (!Number.isInteger(index) || index < 0 || index >= list.length || to < 0 || to >= list.length) return [...list];
+  const out = [...list];
+  [out[index], out[to]] = [out[to], out[index]];
+  return out;
+}
+
 // Gleicher Favorit = gleiche Ausgabe und gleicher Ort (ohne Beachtung von Gross-/Kleinschreibung).
 export function sameFavorite(a, b) {
   const k = (f) => `${f.ausgabe}\u0000${f.ort}`.toLocaleLowerCase('de-DE');

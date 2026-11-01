@@ -1,4 +1,4 @@
-import { ApiError, MAX_FAVORITES, buildSuggestions, displayAmount, errorMessage, findDuplicate, formatEuro, parseAmount, parseSpeechMulti, sameFavorite, sanitizeFavorites, totalExpenses, validateFavorite } from './util.js';
+import { ApiError, MAX_FAVORITES, buildSuggestions, displayAmount, errorMessage, findDuplicate, formatEuro, moveItem, parseAmount, parseSpeechMulti, sameFavorite, sanitizeFavorites, totalExpenses, validateFavorite } from './util.js';
 
 const $app = document.getElementById('app');
 const $sheet = document.getElementById('sheet');
@@ -686,18 +686,43 @@ function openFavorites() {
       h('div', { class: 'actions' }, h('button', { class: 'btn', onclick: closeSheet, text: 'Schließen' })));
   }
   const favs = favorites();
+  const baseHash = state.data.favorites.hash;
   const list = h('ul', { class: 'list' });
+  const errBox = h('div', { class: 'msg-error', role: 'alert', hidden: true });
+  let busy = false;
+
+  // Verschiebt einen Favoriten um eine Position; gespeichert wird auf Basis des gesehenen Stands (Konflikt = nichts überschrieben).
+  async function move(i, delta) {
+    if (busy) return;
+    busy = true;
+    list.querySelectorAll('.move').forEach((b) => { b.disabled = true; });
+    errBox.hidden = true;
+    const err = await saveFavorites(moveItem(favs, i, delta), baseHash);
+    if (err?.auth) return;
+    if (err) {
+      toast(err.message);
+      return openFavorites(); // zeigt den aktuellen Stand (bei Konflikt bereits neu geladen)
+    }
+    openFavorites();
+  }
+
   favs.forEach((f, i) => {
-    list.append(h('li', {}, h('button', { class: 'item', onclick: () => openFavoriteForm(i), 'aria-label': `Favorit ${f.ausgabe} bearbeiten` },
-      h('div', { class: 'main' },
-        h('div', { class: 'title', text: f.ausgabe }),
-        f.ort ? h('div', { class: 'sub', text: f.ort }) : null),
-      h('span', { class: 'amount', text: f.betrag ? formatEuro(f.betrag) : '–' }))));
+    const arrow = (delta, text, label) => h('button', { type: 'button', class: 'move', text, 'aria-label': `${f.ausgabe} ${label}`,
+      disabled: i + delta < 0 || i + delta >= favs.length, onclick: () => move(i, delta) });
+    list.append(h('li', { class: 'fav-li' },
+      h('button', { class: 'item', onclick: () => openFavoriteForm(i), 'aria-label': `Favorit ${f.ausgabe} bearbeiten` },
+        h('div', { class: 'main' },
+          h('div', { class: 'title', text: f.ausgabe }),
+          f.ort ? h('div', { class: 'sub', text: f.ort }) : null),
+        h('span', { class: 'amount', text: f.betrag ? formatEuro(f.betrag) : '–' })),
+      h('div', { class: 'reorder' }, arrow(-1, '▲', 'nach oben'), arrow(1, '▼', 'nach unten'))));
   });
   openSheet(
     h('h2', { text: 'Favoriten' }),
     favs.length ? list : h('p', { class: 'note', text: 'Noch keine Favoriten. Lege häufige Ausgaben an, zum Beispiel „Brötchen, Bäcker Müller, 6,50". Sie erscheinen dann auf der Startseite und füllen das Formular mit einem Tipp vor.' }),
     h('p', { class: 'note', text: 'Die Favoriten stehen im Tabellenblatt „Favoriten" deiner Excel-Datei (Spalten Ausgabe, Ort, Betrag). Sie gelten auf allen Geräten und lassen sich dort auch direkt bearbeiten.' }),
+    favs.length > 1 ? h('p', { class: 'note', text: 'Mit ▲ und ▼ änderst du die Reihenfolge. Der erste Favorit steht auf der Startseite ganz links.' }) : null,
+    errBox,
     h('div', { class: 'actions' },
       h('button', { class: 'btn ghost', onclick: closeSheet, text: 'Schließen' }),
       h('button', { class: 'btn', disabled: favs.length >= MAX_FAVORITES, onclick: () => openFavoriteForm(null), text: '＋ Neu' })),
