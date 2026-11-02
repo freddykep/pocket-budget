@@ -3,7 +3,7 @@
 // noetig (der Passwort-Manager des Handys fuellt es per Fingerabdruck/Gesicht aus).
 
 const KEY = 'pb_vault_key';
-export const MIN_PASSWORD = 10;
+export const MIN_PASSWORD = 6;
 const ITERATIONS = 600_000;
 
 let memoryKey = null; // Rueckfall, falls sessionStorage nicht verfuegbar ist
