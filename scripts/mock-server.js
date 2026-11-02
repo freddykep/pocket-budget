@@ -4,8 +4,8 @@
 import { readFileSync } from 'node:fs';
 import { createServer } from 'node:http';
 import { extname, join } from 'node:path';
-import { HttpError, readJson, send, wrap } from '../lib/http.js';
-import { PreconditionFailed, appendRecord, appendRecords, assignMissingIds, clearList, deleteRecord, readSheet, saveFavorites, updateRecord } from '../lib/workbook-service.js';
+import { HttpError, readJson, send, sendFile, wrap } from '../lib/http.js';
+import { PreconditionFailed, exportFile, appendRecord, appendRecords, assignMissingIds, clearList, deleteRecord, readSheet, saveFavorites, updateRecord } from '../lib/workbook-service.js';
 
 const publicDir = join(import.meta.dirname, '..', 'public');
 const fixture = process.env.FIXTURE || join(import.meta.dirname, '..', 'testdata', 'test.xlsx');
@@ -43,6 +43,10 @@ createServer(wrap(async (req, res) => {
   if (route) {
     if (!drive.signedIn && pathname.startsWith('/api/') && pathname !== '/api/auth/logout') throw new HttpError(401, 'not_signed_in', 'Nicht angemeldet');
     return send(res, 200, await route(req));
+  }
+  if (pathname === '/api/excel/download' && drive.signedIn) {
+    const f = await exportFile(io);
+    return sendFile(res, f.buf, f.name, 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
   }
   if (pathname === '/api/auth/login') { drive.signedIn = true; res.statusCode = 302; res.setHeader('location', '/'); return res.end(); }
   const rel = pathname === '/' ? '/index.html' : pathname;

@@ -11,6 +11,7 @@ import {
   assignMissingIds,
   clearList,
   deleteRecord,
+  exportFile,
   readSheet,
   saveFavorites,
   updateRecord,
@@ -550,4 +551,11 @@ test('Aufrufe pro Vorgang: Lesen 1 Runde (parallel), Aendern Metadaten, Inhalt, 
   calls.length = 0;
   await appendRecord(traced, { ausgabe: 'X', betrag: 1 });
   assert.deepEqual(calls, ['meta', 'download', 'upload']);
+});
+
+test('exportFile liefert Name und unveraenderte Bytes', { skip }, async () => {
+  const { io } = fakeDrive();
+  const out = await exportFile(io);
+  assert.equal(out.name, 'test.xlsx');
+  assert.ok(out.buf.equals(original()));
 });
