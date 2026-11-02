@@ -1,12 +1,17 @@
 import { assertSameOrigin, method, readJson, send, wrap } from '../../lib/http.js';
-import { requireFileIo } from '../../lib/selected.js';
-import { saveFavorites, updateRecord } from '../../lib/workbook-service.js';
+import { readState, saveFavorites, updateEntry } from '../../lib/expenses.js';
+import { requireUser } from '../../lib/session.js';
+import { requireVault } from '../../lib/vault.js';
 
 export default wrap(async (req, res) => {
   method(req, 'POST');
   assertSameOrigin(req);
-  const io = await requireFileIo(req);
+  // Beides noetig: Microsoft-Sitzung (App-Zugang) und Tresor-Schluessel (Passwort). Erst die Sitzung: ohne sie
+  // darf nicht erkennbar sein, ob zu einem Schluessel ein Tresor existiert.
+  await requireUser(req);
+  const vault = await requireVault(req);
   const body = await readJson(req);
   // Ein Eintrag ({ id, ... }) oder die Favoritenliste ({ favorites }): gemeinsame Function wegen des 12-Functions-Limits.
-  send(res, 200, Array.isArray(body?.favorites) ? await saveFavorites(io, body) : await updateRecord(io, body));
+  const r = Array.isArray(body?.favorites) ? await saveFavorites(vault, body) : await updateEntry(vault, body);
+  send(res, 200, { ...r, state: await readState(vault) });
 });

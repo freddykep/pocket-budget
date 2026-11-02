@@ -1,7 +1,7 @@
 // Service Worker: speichert nur die statische App-Huelle (Offline-Start). API-Antworten mit
 // Ausgabedaten werden NIEMALS zwischengespeichert.
 const CACHE = 'pocket-budget-shell-v1';
-const SHELL = ['/', '/styles.css', '/app.js', '/util.js', '/manifest.webmanifest', '/icons/logo.svg', '/icons/icon-192.png'];
+const SHELL = ['/', '/styles.css', '/app.js', '/util.js', '/vault.js', '/manifest.webmanifest', '/icons/logo.svg', '/icons/icon-192.png'];
 
 self.addEventListener('install', (e) => {
   e.waitUntil(caches.open(CACHE).then((c) => c.addAll(SHELL)).then(() => self.skipWaiting()));

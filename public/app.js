@@ -1,4 +1,5 @@
 import { ApiError, MAX_FAVORITES, buildSuggestions, displayAmount, errorMessage, findDuplicate, formatEuro, moveItem, parseAmount, parseSpeechMulti, sameFavorite, sanitizeFavorites, totalExpenses, validateFavorite } from './util.js';
+import { MIN_PASSWORD, clearVaultKey, currentVaultKey, deriveKey, setVaultKey } from './vault.js';
 
 const $app = document.getElementById('app');
 const $sheet = document.getElementById('sheet');
@@ -7,11 +8,11 @@ const $toast = document.getElementById('toast');
 const state = { me: null, data: null, lastSync: 0, showAll: false, loading: false, loadError: null, homeActive: false, query: '' };
 const RECENT = 30;
 
-// ---- Favoriten: liegen im Blatt "Favoriten" der Excel-Datei (kommen mit /api/excel/read) ------------
+// ---- Favoriten: liegen verschlüsselt in der Datenbank (kommen mit /api/excel/read) -------------------
 
 const favorites = () => sanitizeFavorites(state.data?.favorites?.items);
 
-// Speichert die komplette Liste auf Basis des Stands `baseHash`, den der Benutzer gesehen hat (so wird nichts aus Excel überschrieben).
+// Speichert die komplette Liste auf Basis des Stands `baseHash`, den der Benutzer gesehen hat (so wird nichts von einem anderen Gerät überschrieben).
 // Gibt null bei Erfolg zurück, sonst { message, conflict }.
 async function saveFavorites(next, baseHash) {
   try {
@@ -20,14 +21,14 @@ async function saveFavorites(next, baseHash) {
     return null;
   } catch (e) {
     if (authExpired(e)) { goLogin(e); return { message: errorMessage(e), auth: true }; }
-    if (e.code === 'conflict') await loadData(); // in Excel geänderte Favoriten übernehmen
+    if (e.code === 'conflict') await loadData(); // auf einem anderen Gerät geänderte Favoriten übernehmen
     return { message: errorMessage(e), conflict: e.code === 'conflict' };
   }
 }
 
 // ---- Hilfsfunktionen -------------------------------------------------------------------------
 
-// Baut DOM-Knoten ohne innerHTML: Texte aus Excel werden nie als HTML interpretiert.
+// Baut DOM-Knoten ohne innerHTML: Gespeicherte Texte werden nie als HTML interpretiert.
 function h(tag, props = {}, ...kids) {
   const el = document.createElement(tag);
   for (const [k, v] of Object.entries(props)) {
@@ -55,7 +56,7 @@ function toast(text, action = null) {
 }
 
 // Macht neu erfasste Eintraege rueckgaengig (Loeschen per ID). Der Hash kommt aus den frisch geladenen Daten:
-// Wurde ein Eintrag inzwischen in Excel geaendert, meldet der Server einen Konflikt und loescht nichts.
+// Wurde ein Eintrag inzwischen geaendert, meldet der Server einen Konflikt und loescht nichts.
 async function undoAppend(ids) {
   try {
     for (const id of ids) {
@@ -83,25 +84,25 @@ function applyWrite(r) {
 }
 const refreshAfterWrite = async (r) => { if (!applyWrite(r)) await loadData(); };
 
-// Kontrolle im Hintergrund (blockiert nichts): Neu erfasste Einträge müssen nach erneutem Einlesen in der Datei stehen.
-async function verifyWritten(ids) {
-  await loadData();
-  if (state.data && !ids.every((id) => state.data.rows.some((r) => r.id === id))) {
-    toast('Achtung: Nicht alle Einträge wurden in der Datei gefunden. Bitte in Excel prüfen.');
-  }
-}
-
 async function api(path, body) {
   if (!navigator.onLine) throw new ApiError('offline');
   const ctl = new AbortController();
   const timer = setTimeout(() => ctl.abort(), 40_000);
   try {
+    const vaultKey = currentVaultKey();
+    const headers = { ...(body === undefined ? {} : { 'content-type': 'application/json' }), ...(vaultKey ? { 'x-vault-key': vaultKey } : {}) };
     const res = await fetch(path, {
-      ...(body === undefined ? {} : { method: 'POST', headers: { 'content-type': 'application/json' }, body: JSON.stringify(body) }),
+      ...(body === undefined ? {} : { method: 'POST', body: JSON.stringify(body) }),
+      headers,
       signal: ctl.signal,
       credentials: 'same-origin',
     });
     const data = await res.json().catch(() => ({}));
+    if (!res.ok && data.error?.code === 'vault_locked' && path !== '/api/me') {
+      // Schlüssel fehlt oder passt nicht (mehr): zurück zur Passwort-Abfrage.
+      clearVaultKey();
+      setTimeout(() => renderVaultLock(errorMessage(new ApiError('vault_locked'))), 0);
+    }
     if (!res.ok) throw new ApiError(data.error?.code || 'internal', data.error?.message, data.error);
     return data;
   } catch (e) {
@@ -143,12 +144,61 @@ function renderLogin(message, isInfo = false) {
       h('div', { class: 'hero' },
         h('img', { src: '/icons/logo.svg', alt: '' }),
         h('h1', { text: 'Pocket Budget' }),
-        h('p', { text: 'Ausgaben schnell erfassen – direkt in deiner Excel-Datei auf OneDrive.' }),
+        h('p', { text: 'Ausgaben schnell erfassen und bei Bedarf in deine Excel-Datei auf OneDrive übertragen.' }),
         message && (isInfo ? h('p', { class: 'note', text: message }) : h('div', { class: 'msg-error', role: 'alert', text: message })),
         h('a', { class: 'btn block', href: '/api/auth/login', text: 'Mit Microsoft OneDrive verbinden' }),
         h('p', { class: 'hint', text: 'Du meldest dich bei Microsoft an. Pocket Budget sieht dein Passwort nie.' }),
       )),
   );
+}
+
+// ---- Tresor: Passwort ----------------------------------------------------------------------
+
+// Entsperren oder neu anlegen. Ein unbekanntes Passwort legt NICHT stillschweigend einen leeren Tresor an: Bei einem
+// Tippfehler sähe sonst alles leer aus. Neu anlegen ist eine bewusste, getrennte Aktion mit Wiederholung des Passworts.
+function renderVaultLock(message = '', mode = 'unlock', done = () => bootHome()) {
+  state.homeActive = false;
+  state.data = null;
+  closeSheet();
+  const create = mode === 'create';
+  const label = create ? 'Tresor anlegen' : 'Entsperren';
+  const pw = h('input', { type: 'password', name: 'password', autocomplete: create ? 'new-password' : 'current-password', required: true, 'aria-label': 'Passwort' });
+  const pw2 = create ? h('input', { type: 'password', name: 'password2', autocomplete: 'new-password', required: true, 'aria-label': 'Passwort wiederholen' }) : null;
+  const errBox = h('div', { class: 'msg-error', role: 'alert', hidden: !message, text: message });
+  const go = h('button', { class: 'btn block', type: 'submit', text: label });
+  const fail = (text) => { errBox.textContent = text; errBox.hidden = false; go.disabled = false; go.textContent = label; };
+  const form = h('form', { class: 'stack', autocomplete: 'on', onsubmit: async (ev) => {
+    ev.preventDefault();
+    errBox.hidden = true;
+    if (create && pw.value.length < MIN_PASSWORD) return fail(`Das Passwort braucht mindestens ${MIN_PASSWORD} Zeichen.`);
+    if (create && pw.value !== pw2.value) return fail('Die beiden Passwörter sind nicht gleich.');
+    go.disabled = true;
+    go.textContent = 'Prüfe…';
+    try {
+      setVaultKey(await deriveKey(pw.value, state.me.vaultSalt));
+      await api('/api/me', { action: create ? 'create' : 'unlock' });
+      done();
+    } catch (e) {
+      clearVaultKey();
+      if (authExpired(e)) return goLogin(e);
+      fail(errorMessage(e));
+    }
+  } },
+    // Verstecktes Benutzerfeld: damit Passwort-Manager (Fingerabdruck/Gesicht) das Passwort speichern und ausfüllen.
+    h('input', { type: 'text', name: 'username', value: 'Pocket Budget', autocomplete: 'username', hidden: true, tabindex: '-1', 'aria-hidden': 'true' }),
+    h('label', { class: 'field' }, h('span', { text: create ? 'Neues Passwort' : 'Passwort' }), pw),
+    pw2 ? h('label', { class: 'field' }, h('span', { text: 'Passwort wiederholen' }), pw2) : null,
+    errBox,
+    go);
+  $app.replaceChildren(h('main', { class: 'page' }, h('div', { class: 'hero' },
+    h('img', { src: '/icons/logo.svg', alt: '' }),
+    h('h1', { text: create ? 'Tresor anlegen' : 'Pocket Budget entsperren' }),
+    h('p', { text: create
+      ? `Deine Ausgaben werden mit diesem Passwort verschlüsselt gespeichert (mindestens ${MIN_PASSWORD} Zeichen). Ohne das Passwort kann sie niemand lesen, auch nicht der Betreiber der App. Es lässt sich nicht zurücksetzen: Wer es vergisst, verliert die noch nicht in Excel übertragenen Einträge. Tipp: Lass dein Handy das Passwort speichern, dann reicht der Fingerabdruck.`
+      : 'Gib dein Passwort ein. Zum ersten Mal hier? Dann lege einen neuen Tresor an.' }),
+    form,
+    h('button', { class: 'link-btn', onclick: () => renderVaultLock('', create ? 'unlock' : 'create', done), text: create ? 'Ich habe schon einen Tresor' : 'Neuen Tresor anlegen' }))));
+  setTimeout(() => pw.focus(), 0);
 }
 
 // ---- Dateiauswahl ----------------------------------------------------------------------------
@@ -177,7 +227,7 @@ async function renderFilePicker(stack = []) {
     body.replaceChildren(
       h('div', { class: 'crumbs', text: `OneDrive / ${stack.map((s) => s.name).join(' / ')}` }),
       items.length ? list : h('div', { class: 'card empty', text: 'Keine Ordner oder Excel-Dateien (.xlsx) hier.' }),
-      h('p', { class: 'hint', text: 'Wähle die Excel-Datei, in der deine Ausgaben gespeichert werden.' }),
+      h('p', { class: 'hint', text: 'Wähle die Excel-Datei, in die deine Ausgaben übertragen werden.' }),
     );
   } catch (e) {
     if (authExpired(e)) return goLogin(e);
@@ -202,6 +252,7 @@ async function selectFile(item) {
 // ---- Startseite ------------------------------------------------------------------------------
 
 function bootHome() {
+  if (!currentVaultKey()) return renderVaultLock();
   renderHome();
   return loadData();
 }
@@ -244,10 +295,10 @@ function paint() {
         h('div', { class: 'meta', text: `${d.summary.count} ${d.summary.count === 1 ? 'Ausgabe' : 'Ausgaben'} · Stand ${time(state.lastSync)}` })),
     );
     nodes.push(favoritesNode());
-    if (d.missingIds > 0) {
+    if (d.pending > 0) {
       nodes.push(h('div', { class: 'card banner' },
-        h('p', { text: `${d.missingIds} ${d.missingIds === 1 ? 'Eintrag hat' : 'Einträge haben'} noch keine technische ID. Sie wird für Änderungen und den Abgleich gebraucht und in einer zusätzlichen Spalte der Excel-Datei abgelegt.` }),
-        h('button', { class: 'btn small', onclick: () => openAssignIds(d.missingIds), text: 'IDs ergänzen' })));
+        h('p', { text: pendingText(d.pending) }),
+        h('button', { class: 'btn small', onclick: openTransfer, text: 'In Excel übertragen' })));
     }
     if (d.rows.length > SEARCH_FROM || state.query) {
       nodes.push(h('input', { type: 'search', class: 'search', placeholder: 'Suchen (Text, Ort oder Betrag)', 'aria-label': 'Einträge durchsuchen',
@@ -262,6 +313,8 @@ function paint() {
 }
 
 const SEARCH_FROM = 8;
+
+const pendingText = (n) => (n === 1 ? '1 Änderung ist noch nicht in der Excel-Datei.' : `${n} Änderungen sind noch nicht in der Excel-Datei.`);
 
 // Schnellwahl: Tippen auf einen Favoriten öffnet das Formular vorbefüllt; geprüft und bestätigt wird weiterhin.
 function favoritesNode() {
@@ -318,7 +371,7 @@ function listNodes() {
   return nodes;
 }
 
-// Beim Start wird die Excel-Datei schon während der Konto-Abfrage gelesen (spart eine Wartezeit); loadData nutzt diese Anfrage einmalig.
+// Beim Start wird der Stand schon während der Konto-Abfrage geladen (spart eine Wartezeit); loadData nutzt diese Anfrage einmalig.
 let prefetched = null;
 
 async function loadData() {
@@ -445,7 +498,7 @@ function openEntrySheet(entry, prefill = null) {
         h('div', {}, h('dt', { text: 'Ausgabe' }), h('dd', { text: entry.ausgabe || '–' })),
         h('div', {}, h('dt', { text: 'Ort' }), h('dd', { text: entry.ort || '–' })),
         h('div', { class: 'big' }, h('dt', { text: 'Betrag' }), h('dd', { text: displayAmount(entry.betrag) }))),
-      h('p', { class: 'note', text: 'Der Eintrag wird aus deiner Excel-Datei entfernt. Die Einträge darunter rücken eine Zeile nach oben.' }),
+      h('p', { class: 'note', text: 'Der Eintrag wird aus der App gelöscht. Wurde er schon in Excel übertragen, verschwindet er dort beim nächsten Übertragen.' }),
       errBox,
       h('div', { class: 'actions' }, backBtn, delBtn),
     );
@@ -470,8 +523,8 @@ function openEntrySheet(entry, prefill = null) {
           : await api('/api/excel/append', { id, ...payload });
         closeSheet();
         applyWrite(r);
-        toast('In Excel gespeichert', isEdit ? null : { label: 'Rückgängig', run: () => undoAppend([id]) });
-        if (!isEdit) verifyWritten([id]); else if (!r.state) loadData();
+        toast('Gespeichert', isEdit ? null : { label: 'Rückgängig', run: () => undoAppend([id]) });
+        if (!r.state) loadData();
       } catch (e) {
         if (authExpired(e)) return goLogin(e);
         let text = errorMessage(e);
@@ -496,8 +549,8 @@ function openEntrySheet(entry, prefill = null) {
         h('div', {}, h('dt', { text: 'Ort' }), h('dd', { text: values.ort.trim() || '–' })),
         h('div', { class: 'big' }, h('dt', { text: 'Betrag' }), h('dd', { text: refund ? `+${formatEuro(amount)}` : formatEuro(amount) }))),
       h('p', { class: 'note', text: refund
-        ? 'Wird als Rückerstattung (positiver Betrag) in deiner Excel-Datei gespeichert.'
-        : 'Wird als Ausgabe (negativer Betrag) in deiner Excel-Datei gespeichert.' }),
+        ? 'Wird als Rückerstattung (positiver Betrag) gespeichert.'
+        : 'Wird als Ausgabe (negativer Betrag) gespeichert.' }),
       dup ? h('p', { class: 'msg-warn', role: 'status', text: `Achtung: Unter den letzten Einträgen gibt es schon einen gleichen (${dup.ausgabe}${dup.ort ? `, ${dup.ort}` : ''}, ${displayAmount(dup.betrag)}). Doppelt erfassen?` }) : null,
       errBox,
       h('div', { class: 'actions' }, backBtn, saveBtn),
@@ -663,8 +716,7 @@ function openMultiSheet({ entries, transcript }) {
         closeSheet();
         const ids = items.map((it) => it.rid);
         applyWrite(r);
-        toast(`${items.length} Ausgaben in Excel gespeichert`, { label: 'Rückgängig', run: () => undoAppend(ids) });
-        verifyWritten(ids);
+        toast(`${items.length} Ausgaben gespeichert`, { label: 'Rückgängig', run: () => undoAppend(ids) });
       } catch (e) {
         if (authExpired(e)) return goLogin(e);
         errBox.textContent = `${errorMessage(e)} Erneut speichern ist sicher, es entsteht kein doppelter Eintrag.`;
@@ -684,7 +736,7 @@ function openMultiSheet({ entries, transcript }) {
       h('h2', { text: 'Bitte prüfen' }),
       list,
       h('dl', { class: 'review' }, h('div', { class: 'big' }, h('dt', { text: 'Summe' }), h('dd', { text: formatEuro(totalExpenses(signed.reduce((a, b) => a + b, 0))) }))),
-      h('p', { class: 'note', text: 'Wird in einem Schritt in deiner Excel-Datei gespeichert. Ausgaben als negativer, Rückerstattungen als positiver Betrag.' }),
+      h('p', { class: 'note', text: 'Wird in einem Schritt gespeichert. Ausgaben als negativer, Rückerstattungen als positiver Betrag.' }),
       dupNotes.length ? h('p', { class: 'msg-warn', role: 'status', text: `Achtung: Gleiche Einträge gibt es schon (${[...new Set(dupNotes)].join(', ')}). Doppelt erfassen?` }) : null,
       errBox,
       h('div', { class: 'actions' }, backBtn, saveBtn),
@@ -695,13 +747,7 @@ function openMultiSheet({ entries, transcript }) {
 // ---- Favoriten verwalten -------------------------------------------------------------------
 
 function openFavorites() {
-  if (!state.data) return toast('Bitte warten, bis die Excel-Datei geladen ist.');
-  if (state.data.favorites?.broken) {
-    return openSheet(
-      h('h2', { text: 'Favoriten' }),
-      h('div', { class: 'msg-error', role: 'alert', text: 'Im Blatt „Favoriten" deiner Excel-Datei fehlen die Spalten Ausgabe, Ort und Betrag in Zeile 1. Bitte in Excel korrigieren; es wurde nichts verändert.' }),
-      h('div', { class: 'actions' }, h('button', { class: 'btn', onclick: closeSheet, text: 'Schließen' })));
-  }
+  if (!state.data) return toast('Bitte warten, bis die Daten geladen sind.');
   const favs = favorites();
   const baseHash = state.data.favorites.hash;
   const list = h('ul', { class: 'list' });
@@ -737,7 +783,7 @@ function openFavorites() {
   openSheet(
     h('h2', { text: 'Favoriten' }),
     favs.length ? list : h('p', { class: 'note', text: 'Noch keine Favoriten. Lege häufige Ausgaben an, zum Beispiel „Brötchen, Bäcker Müller, 6,50". Sie erscheinen dann auf der Startseite und füllen das Formular mit einem Tipp vor.' }),
-    h('p', { class: 'note', text: 'Die Favoriten stehen im Tabellenblatt „Favoriten" deiner Excel-Datei (Spalten Ausgabe, Ort, Betrag). Sie gelten auf allen Geräten und lassen sich dort auch direkt bearbeiten.' }),
+    h('p', { class: 'note', text: 'Die Favoriten gelten auf allen Geräten, auf denen du angemeldet bist.' }),
     favs.length > 1 ? h('p', { class: 'note', text: 'Mit ▲ und ▼ änderst du die Reihenfolge. Der erste Favorit steht auf der Startseite ganz links.' }) : null,
     errBox,
     h('div', { class: 'actions' },
@@ -810,39 +856,10 @@ function openFavoriteForm(index, errors = {}, draft = null, serverError = '') {
   form.querySelector(errors.betrag ? '[name=betrag]' : errors.ort ? '[name=ort]' : '[name=ausgabe]')?.focus();
 }
 
-// ---- IDs ergänzen ----------------------------------------------------------------------------
-
-function openAssignIds(count, then) {
-  const errBox = h('div', { class: 'msg-error', role: 'alert', hidden: true });
-  const go = h('button', { class: 'btn', text: 'IDs ergänzen', onclick: async () => {
-    go.disabled = true;
-    go.textContent = 'Ergänze…';
-    try {
-      const r = await api('/api/excel/assign-ids', {});
-      closeSheet();
-      toast(`${r.assigned} ${r.assigned === 1 ? 'ID' : 'IDs'} ergänzt`);
-      await refreshAfterWrite(r);
-      then?.();
-    } catch (e) {
-      if (authExpired(e)) return goLogin(e);
-      errBox.textContent = errorMessage(e);
-      errBox.hidden = false;
-      go.disabled = false;
-      go.textContent = 'Erneut versuchen';
-    }
-  } });
-  openSheet(
-    h('h2', { text: 'IDs ergänzen' }),
-    h('p', { text: `Für ${count} ${count === 1 ? 'Eintrag' : 'Einträge'} wird in der Spalte „ID" der Excel-Datei eine technische Kennung ergänzt. Vorhandene IDs und alle anderen Inhalte bleiben unverändert.` }),
-    errBox,
-    h('div', { class: 'actions' }, h('button', { class: 'btn ghost', onclick: closeSheet, text: 'Abbrechen' }), go),
-  );
-}
-
-// ---- Excel leeren ----------------------------------------------------------------------------
+// ---- Liste leeren ----------------------------------------------------------------------------
 
 async function openClearSheet() {
-  openSheet(h('h2', { text: 'Excel leeren' }), h('p', { text: 'Lade aktuellen Stand…' }));
+  openSheet(h('h2', { text: 'Liste leeren' }), h('p', { text: 'Lade aktuellen Stand…' }));
   let d;
   try {
     d = await api('/api/excel/read');
@@ -851,22 +868,14 @@ async function openClearSheet() {
     paint();
   } catch (e) {
     if (authExpired(e)) return goLogin(e);
-    return openSheet(h('h2', { text: 'Excel leeren' }), h('div', { class: 'msg-error', role: 'alert', text: errorMessage(e) }),
+    return openSheet(h('h2', { text: 'Liste leeren' }), h('div', { class: 'msg-error', role: 'alert', text: errorMessage(e) }),
       h('div', { class: 'actions' }, h('button', { class: 'btn ghost', onclick: closeSheet, text: 'Schließen' })));
   }
 
   if (!d.rows.length) {
-    return openSheet(h('h2', { text: 'Excel leeren' }), h('p', { text: 'Die Liste ist bereits leer.' }),
+    return openSheet(h('h2', { text: 'Liste leeren' }), h('p', { text: 'Die Liste ist bereits leer.' }),
       h('div', { class: 'actions' }, h('button', { class: 'btn', onclick: closeSheet, text: 'OK' })));
   }
-  if (d.missingIds > 0) {
-    return openSheet(h('h2', { text: 'Excel leeren' }),
-      h('p', { text: `${d.missingIds} ${d.missingIds === 1 ? 'Eintrag hat' : 'Einträge haben'} noch keine ID. Zum Leeren muss die Datei eindeutig als Erfassungsliste erkannt werden.` }),
-      h('div', { class: 'actions' },
-        h('button', { class: 'btn ghost', onclick: closeSheet, text: 'Abbrechen' }),
-        h('button', { class: 'btn', onclick: () => openAssignIds(d.missingIds, openClearSheet), text: 'IDs ergänzen' })));
-  }
-
   const errBox = h('div', { class: 'msg-error', role: 'alert', hidden: true });
   const go = h('button', { class: 'btn danger', disabled: true, text: 'Excel jetzt leeren' });
   const check = h('input', { type: 'checkbox', id: 'confirm-clear', onchange: (ev) => { go.disabled = !ev.target.checked; } });
@@ -878,7 +887,7 @@ async function openClearSheet() {
     try {
       const r = await api('/api/excel/clear', { expectedListHash: d.listHash });
       closeSheet();
-      toast(`Excel geleert (${r.cleared} ${r.cleared === 1 ? 'Eintrag' : 'Einträge'})`);
+      toast(`Liste geleert (${d.summary.count} ${d.summary.count === 1 ? 'Eintrag' : 'Einträge'})`);
       await refreshAfterWrite(r);
     } catch (e) {
       if (authExpired(e)) return goLogin(e);
@@ -895,15 +904,33 @@ async function openClearSheet() {
   });
 
   openSheet(
-    h('h2', { text: 'Excel leeren' }),
+    h('h2', { text: 'Liste leeren' }),
     h('dl', { class: 'review' },
       h('div', {}, h('dt', { text: 'Einträge' }), h('dd', { text: String(d.summary.count) })),
       h('div', { class: 'big' }, h('dt', { text: 'Gesamtsumme' }), h('dd', { text: formatEuro(totalExpenses(d.summary.total)) }))),
-    h('p', { class: 'note', text: 'Entfernt alle Einträge aus der Excel-Datei. Überschriften, Formatierung und verbundene Zellen bleiben erhalten. Zurückholen geht nur über den Versionsverlauf in OneDrive.' }),
+    h('p', { class: 'note', text: 'Löscht alle Einträge in der App und in der Excel-Datei. Überschriften, Formatierung und verbundene Zellen in Excel bleiben erhalten. Zurückholen geht nur über den Versionsverlauf in OneDrive.' }),
+    d.pending > 0 ? h('p', { class: 'msg-error', role: 'alert', text: `Achtung: ${pendingText(d.pending)} Sie gehen mit dem Leeren verloren. Zuerst „In Excel übertragen“ wählen, falls du sie brauchst.` }) : null,
     h('label', { class: 'item' }, check, h('span', { text: 'Ich habe die Ausgaben in meine Haushalts-Excel übernommen.' })),
     errBox,
     h('div', { class: 'actions' }, h('button', { class: 'btn ghost', onclick: closeSheet, text: 'Abbrechen' }), go),
   );
+}
+
+// ---- In Excel übertragen ---------------------------------------------------------------------
+
+async function openTransfer() {
+  openSheet(h('h2', { text: 'In Excel übertragen' }), h('p', { text: 'Übertrage in die Excel-Datei …' }));
+  try {
+    const r = await api('/api/excel/sync', {});
+    closeSheet();
+    applyWrite(r);
+    const n = r.added + r.updated + r.removed;
+    toast(n ? `In Excel übertragen (${n} ${n === 1 ? 'Änderung' : 'Änderungen'})` : 'Excel war schon aktuell');
+  } catch (e) {
+    if (authExpired(e)) return goLogin(e);
+    openSheet(h('h2', { text: 'In Excel übertragen' }), h('div', { class: 'msg-error', role: 'alert', text: errorMessage(e) }),
+      h('div', { class: 'actions' }, h('button', { class: 'btn ghost', onclick: closeSheet, text: 'Schließen' }), h('button', { class: 'btn', onclick: openTransfer, text: 'Erneut versuchen' })));
+  }
 }
 
 // ---- Excel bereitstellen -----------------------------------------------------------------------
@@ -917,7 +944,7 @@ async function fetchExcelCopy() {
   const ctl = new AbortController();
   const timer = setTimeout(() => ctl.abort(), 40_000);
   try {
-    const res = await fetch('/api/excel/read?download=1', { signal: ctl.signal, credentials: 'same-origin' });
+    const res = await fetch('/api/excel/read?download=1', { signal: ctl.signal, credentials: 'same-origin', headers: { 'x-vault-key': currentVaultKey() ?? '' } });
     if (!res.ok) {
       const data = await res.json().catch(() => ({}));
       throw new ApiError(data.error?.code || 'internal', data.error?.message, data.error);
@@ -936,7 +963,7 @@ async function fetchExcelCopy() {
 }
 
 function openShareExcel() {
-  openSheet(h('h2', { text: 'Excel bereitstellen' }), h('p', { text: 'Excel-Datei wird geladen …' }),
+  openSheet(h('h2', { text: 'Excel bereitstellen' }), h('p', { text: 'Neue Einträge werden in Excel übertragen und die Datei geladen …' }),
     h('div', { class: 'actions' }, h('button', { class: 'btn ghost', onclick: closeSheet, text: 'Abbrechen' })));
   fetchExcelCopy().then(
     (file) => {
@@ -960,7 +987,7 @@ function openShareExcel() {
       };
       openSheet(
         h('h2', { text: 'Excel bereitstellen' }),
-        h('p', { text: `Eine Kopie von „${file.name}“ (Stand jetzt) kannst du herunterladen oder zum Beispiel per WhatsApp, Mail oder Teams teilen. Deine Datei in OneDrive bleibt unverändert.` }),
+        h('p', { text: `Eine Kopie von „${file.name}“ (Stand jetzt) kannst du herunterladen oder zum Beispiel per WhatsApp, Mail oder Teams teilen. Alle Einträge sind vorher in die Datei in OneDrive übertragen worden.` }),
         h('div', { class: 'stack' },
           canShare ? h('button', { class: 'btn', onclick: share, text: 'Teilen …' }) : null,
           h('button', { class: canShare ? 'btn secondary' : 'btn', onclick: download, text: 'Herunterladen' })),
@@ -985,14 +1012,16 @@ function openSettings() {
       h('div', {}, h('dt', { text: 'Microsoft-Konto' }), h('dd', { text: `${me.displayName ?? ''} (${me.account ?? ''})` })),
       h('div', {}, h('dt', { text: 'Excel-Datei' }), h('dd', { text: me.selectedFile?.name ?? '–' }))),
     h('div', { class: 'stack' },
+      h('button', { class: 'btn secondary', onclick: openTransfer, text: 'In Excel übertragen' }),
       h('button', { class: 'btn secondary', onclick: openShareExcel, text: 'Excel bereitstellen' }),
       h('button', { class: 'btn secondary', onclick: openFavorites, text: '☆ Favoriten verwalten' }),
       h('button', { class: 'btn secondary', onclick: () => { closeSheet(); renderFilePicker(); }, text: 'Andere Datei wählen' }),
+      h('button', { class: 'btn secondary', onclick: () => { clearVaultKey(); renderVaultLock(); }, text: 'App sperren' }),
       h('button', { class: 'btn ghost', onclick: openDisconnect, text: 'Verbindung trennen' })),
     h('div', { class: 'danger-zone' },
-      h('h3', { text: 'Excel leeren' }),
-      h('p', { text: 'Entfernt alle erfassten Ausgaben aus der Excel-Datei, zum Beispiel nach der Übernahme in die Haushalts-Excel.' }),
-      h('button', { class: 'btn ghost block', onclick: openClearSheet, text: 'Excel leeren…' })),
+      h('h3', { text: 'Liste leeren' }),
+      h('p', { text: 'Löscht alle erfassten Ausgaben in der App und in der Excel-Datei, zum Beispiel nach der Übernahme in die Haushalts-Excel.' }),
+      h('button', { class: 'btn ghost block', onclick: openClearSheet, text: 'Liste leeren…' })),
     h('div', { class: 'actions' }, h('button', { class: 'btn ghost', onclick: closeSheet, text: 'Schließen' })),
   );
 }
@@ -1026,8 +1055,7 @@ async function boot() {
   if (urlError) history.replaceState(null, '', '/');
   try {
     // Gleichzeitig starten: Konto-Abfrage und Lesen der Excel-Datei. Ohne Anmeldung oder Datei wird das Ergebnis verworfen.
-    prefetched = api('/api/excel/read');
-    prefetched.catch(() => {});
+    if (currentVaultKey()) { prefetched = api('/api/excel/read'); prefetched.catch(() => {}); }
     state.me = await api('/api/me');
   } catch (e) {
     prefetched = null;
@@ -1039,7 +1067,7 @@ async function boot() {
   bootHome();
 }
 
-// Beim Zurückkehren in die App den aktuellen Excel-Stand holen (Änderungen aus Excel werden sichtbar).
+// Beim Zurückkehren in die App den aktuellen Stand holen (Änderungen von einem anderen Gerät werden sichtbar).
 document.addEventListener('visibilitychange', () => {
   if (!document.hidden && state.homeActive && !$sheet.open && Date.now() - state.lastSync > 30_000) loadData();
 });
