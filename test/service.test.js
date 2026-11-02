@@ -1,23 +1,20 @@
 import assert from 'node:assert/strict';
-import { existsSync, readFileSync } from 'node:fs';
+import { existsSync, mkdtempSync, readFileSync } from 'node:fs';
+import { tmpdir } from 'node:os';
+import { randomBytes } from 'node:crypto';
+import { join } from 'node:path';
 import { test } from 'node:test';
 import ExcelJS from 'exceljs';
 import JSZip from 'jszip';
 import { decrypt, encrypt } from '../lib/crypto.js';
-import {
-  PreconditionFailed,
-  appendRecord,
-  appendRecords,
-  assignMissingIds,
-  clearList,
-  deleteRecord,
-  exportFile,
-  readSheet,
-  saveFavorites,
-  updateRecord,
-} from '../lib/workbook-service.js';
+import { addEntries, deleteEntry, listEntries, readFavorites, readState, saveFavorites, updateEntry } from '../lib/expenses.js';
+import { store } from '../lib/store.js';
+import { clearAll, exportExcel, importFromExcelOnce, transferToExcel } from '../lib/transfer.js';
+import { VAULT_HEADER, createVault, requireVault, unlockVault, vaultFromKey, vaultSalt } from '../lib/vault.js';
+import { PreconditionFailed, readSheet } from '../lib/workbook-service.js';
 
 process.env.TOKEN_ENC_KEY = Buffer.alloc(32, 7).toString('base64');
+process.env.DATA_DIR = mkdtempSync(join(tmpdir(), 'pocket-budget-test-'));
 
 // Fixture: die echte Testdatei (verbundene Zellen B:D, ID in A, Ort E, Betrag F). Bleibt ausserhalb des Repos.
 const FIXTURE = new URL('../testdata/test.xlsx', import.meta.url);
@@ -55,7 +52,15 @@ const rowXml = (sheet, n) => new RegExp(`<row r="${n}"[\\s\\S]*?</row>`).exec(sh
 const merges = (sheet) => [...sheet.matchAll(/<mergeCell ref="([^"]+)"/g)].map((m) => m[1]);
 const SHEET = 'xl/worksheets/sheet1.xml';
 
-test('liest die echte Struktur: ID in A, Ausgabe in B:D (verbunden), Ort in E, Betrag in F', { skip }, async () => {
+let counter = 0;
+const newKey = () => randomBytes(32).toString('base64url');
+const newUser = () => vaultFromKey(newKey()); // Tresor { id, key }
+const reqWith = (key) => ({ headers: { [VAULT_HEADER]: key } });
+const add = (u, r) => addEntries(u, [r]);
+const sync = (u, io, opts) => transferToExcel(u, io, opts);
+const excelRows = async (io) => (await readSheet(io)).rows;
+
+test('liest die Struktur der Datei (einmalige Uebernahme): ID in A, Ausgabe in B:D (verbunden), Ort in E, Betrag in F', { skip }, async () => {
   const { io } = fakeDrive();
   const d = await readSheet(io);
   assert.equal(d.rows.length, 12);
@@ -63,263 +68,259 @@ test('liest die echte Struktur: ID in A, Ausgabe in B:D (verbunden), Ort in E, B
   assert.equal(d.rows[0].ort, '', 'Ort " " gilt als leer');
   assert.equal(d.rows[0].betrag, -26);
   assert.equal(d.rows[11].id, '57583a13');
-  assert.equal(d.rows[11].ausgabe, 'Neue Ausgabe');
-  assert.equal(d.missingIds, 11);
-  assert.equal(d.summary.count, 12);
-  assert.equal(d.summary.total, -26 - 5.5 - 10.99 - 7.8 - 26 - 6.23 - 16.2 - 50.8 - 46 - 497.49 - 2.49 - 24.9);
+  assert.equal(d.rows.filter((r) => r.id === '').length, 11);
 });
 
-test('append: neue Zeile erhaelt Stil, Merge B:D, ID; nichts anderes aendert sich', { skip }, async () => {
+test('Erfassen, Aendern, Loeschen und Favoriten beruehren die Excel-Datei nicht', { skip }, async () => {
+  const { state } = fakeDrive();
+  const u = newUser();
+  await add(u, { id: 'erf-0001-aaaa', ausgabe: 'Brot', ort: 'Baecker', betrag: '2,50' });
+  const [e] = await listEntries(u);
+  await updateEntry(u, { id: e.id, expectedHash: e.hash, values: { ausgabe: 'Brot', ort: '', betrag: 3 } });
+  await saveFavorites(u, { favorites: [{ ausgabe: 'Brot', ort: '', betrag: 3 }], expectedHash: (await readFavorites(u)).hash });
+  const st = await readState(u);
+  assert.equal(st.summary.count, 1);
+  assert.equal(st.summary.total, -3);
+  assert.equal(st.pending, 1);
+  assert.equal(state.uploads, 0);
+  assert.equal(state.v, 1);
+});
+
+test('Uebertragen: neue Zeile erhaelt Stil, Merge B:D, ID; nichts anderes aendert sich; Eintraege bleiben in der DB', { skip }, async () => {
   const { io, state } = fakeDrive();
+  const u = newUser();
   const before = await entries(state.buf);
-  const r = await appendRecord(io, { id: 'neu-0001-aaaa', ausgabe: 'Tom & Jerry <3 "x"', ort: 'REWE', betrag: '84,50' });
-  assert.equal(r.row, 14);
+  await add(u, { id: 'neu-0001-aaaa', ausgabe: 'Tom & Jerry <3 "x"', ort: 'REWE', betrag: '84,50' });
+  const r = await sync(u, io);
+  assert.equal(r.added, 1);
   const after = await entries(state.buf);
 
   for (const name of Object.keys(before)) if (name !== SHEET) assert.equal(after[name], before[name], `${name} unveraendert`);
-  for (let n = 1; n <= 13; n++) assert.equal(rowXml(after[SHEET], n), rowXml(before[SHEET], n), `Zeile ${n} byte-identisch`);
-
+  for (let i = 1; i <= 13; i++) assert.equal(rowXml(after[SHEET], i), rowXml(before[SHEET], i), `Zeile ${i} byte-identisch`);
   const row14 = rowXml(after[SHEET], 14);
   assert.match(row14, /<c r="B14" s="5"/);
-  assert.match(row14, /<c r="C14" s="6"/);
-  assert.match(row14, /<c r="D14" s="7"/);
   assert.match(row14, /<c r="E14" s="3"/);
   assert.match(row14, /<c r="F14" s="4"><v>-84.5<\/v><\/c>/, 'Betrag als negative Zahl mit Zellformat');
   assert.deepEqual(merges(after[SHEET]), [...merges(before[SHEET]), 'B14:D14']);
-  assert.match(after[SHEET], /<mergeCells count="13">/);
-  assert.match(after[SHEET], /<dimension ref="A1:F14"\/>/);
 
-  const d = await readSheet(io);
-  const e = d.rows.at(-1);
+  const e = (await excelRows(io)).at(-1);
   assert.deepEqual([e.id, e.ausgabe, e.ort, e.betrag], ['neu-0001-aaaa', 'Tom & Jerry <3 "x"', 'REWE', -84.5]);
-});
+  assert.equal((await listEntries(u)).length, 1, 'Eintrag bleibt in der DB');
+  assert.equal(r.state.pending, 0);
+  assert.ok(r.state.lastTransfer);
 
-test('Ausgabedatei ist eine gueltige Arbeitsmappe (ExcelJS oeffnet sie, Merges vorhanden)', { skip }, async () => {
-  const { io, state } = fakeDrive();
-  await appendRecord(io, { ausgabe: 'Test', ort: '', betrag: 1 });
   const wb = new ExcelJS.Workbook(); await wb.xlsx.load(state.buf);
-  const ws = wb.worksheets[0];
-  assert.equal(ws.getCell('B14').value, 'Test');
-  assert.equal(ws.getCell('C14').isMerged, true);
-  assert.equal(ws.getCell('B2').master.address, 'B2');
+  assert.equal(wb.worksheets[0].getCell('B14').value, 'Tom & Jerry <3 "x"');
+  assert.equal(wb.worksheets[0].getCell('C14').isMerged, true);
 });
 
-test('Vorzeichen: Standard negativ, nur refund:true speichert positiv; Update wechselt zurueck', { skip }, async () => {
+test('Uebertragen ist wiederholbar: zweiter Lauf laedt nichts hoch, keine Dubletten', { skip }, async () => {
+  const { io, state } = fakeDrive();
+  const u = newUser();
+  await addEntries(u, [{ id: 'wdh-0001-aaaa', ausgabe: 'A', betrag: 1 }, { id: 'wdh-0002-aaaa', ausgabe: 'B', betrag: 2 }]);
+  await sync(u, io);
+  assert.equal(state.uploads, 1);
+  const again = await sync(u, io);
+  assert.equal(again.added + again.updated + again.removed, 0);
+  assert.equal(state.uploads, 1);
+  assert.equal((await excelRows(io)).length, 14);
+});
+
+test('Vorzeichen: Standard negativ, nur refund:true speichert positiv', async () => {
+  const u = newUser();
+  await add(u, { id: 'neg-0001-aaaa', ausgabe: 'A', betrag: '10' });
+  await add(u, { id: 'neg-0002-aaaa', ausgabe: 'B', betrag: '-10' });
+  await add(u, { id: 'pos-0001-aaaa', ausgabe: 'R', betrag: '10', refund: true });
+  await add(u, { id: 'neg-0003-aaaa', ausgabe: 'C', betrag: '10', refund: 'true' });
+  const by = Object.fromEntries((await listEntries(u)).map((e) => [e.id, e.betrag]));
+  assert.deepEqual(by, { 'neg-0001-aaaa': -10, 'neg-0002-aaaa': -10, 'pos-0001-aaaa': 10, 'neg-0003-aaaa': -10 });
+  const row = (await listEntries(u)).find((e) => e.id === 'pos-0001-aaaa');
+  await updateEntry(u, { id: row.id, expectedHash: row.hash, values: { ausgabe: 'R', ort: '', betrag: 10 } });
+  assert.equal((await listEntries(u)).find((e) => e.id === 'pos-0001-aaaa').betrag, -10);
+});
+
+test('Mehrere Eintraege: Reihenfolge bleibt, Wiederholung erzeugt keine Dubletten, ungueltige Eingaben speichern nichts', async () => {
+  const u = newUser();
+  const recs = [{ id: 'mul-0001-aaaa', ausgabe: 'Eins', betrag: 1 }, { id: 'mul-0002-aaaa', ausgabe: 'Zwei', betrag: 2, refund: true }];
+  assert.equal((await addEntries(u, recs)).added, 2);
+  assert.equal((await addEntries(u, recs)).added, 0);
+  assert.deepEqual((await listEntries(u)).map((e) => e.ausgabe), ['Eins', 'Zwei']);
+  for (const bad of [{ ausgabe: '', betrag: 1 }, { ausgabe: 'x', betrag: 'abc' }, { ausgabe: 'x', betrag: 0 }]) {
+    await assert.rejects(add(u, bad), (e) => e.status === 422);
+  }
+  await assert.rejects(add(u, { id: 'a b', ausgabe: 'x', betrag: 1 }), (e) => e.code === 'bad_id');
+  await assert.rejects(addEntries(u, [{ ausgabe: 'x', betrag: 1 }, { ausgabe: 'y', betrag: 0 }]), (e) => e.status === 422);
+  assert.equal((await listEntries(u)).length, 2);
+});
+
+test('Aendern und Loeschen: Konflikt bei veraltetem Stand, Loeschen ist idempotent, fremde Nutzer sehen nichts', async () => {
+  const u = newUser();
+  await add(u, { id: 'chg-0001-aaaa', ausgabe: 'A', betrag: 1 });
+  const [e] = await listEntries(u);
+  await updateEntry(u, { id: e.id, expectedHash: e.hash, values: { ausgabe: 'B', betrag: 1 } });
+  await assert.rejects(updateEntry(u, { id: e.id, expectedHash: e.hash, values: { ausgabe: 'C', betrag: 1 } }), (x) => x.code === 'conflict');
+  await assert.rejects(deleteEntry(u, { id: e.id, expectedHash: e.hash }), (x) => x.code === 'conflict');
+  await assert.rejects(updateEntry(u, { id: 'gibt-es-nicht', expectedHash: 'x', values: { ausgabe: 'C', betrag: 1 } }), (x) => x.code === 'row_not_found');
+  assert.equal((await listEntries(newUser())).length, 0, 'anderer Benutzer sieht die Eintraege nicht');
+  const now = (await listEntries(u))[0];
+  assert.equal((await deleteEntry(u, { id: now.id, expectedHash: now.hash })).deleted, true);
+  assert.equal((await deleteEntry(u, { id: now.id, expectedHash: now.hash })).deleted, false);
+});
+
+test('Nach dem Uebertragen: Aenderung und Loeschen wirken beim naechsten Uebertragen auch in Excel, fremde Zeilen bleiben', { skip }, async () => {
   const { io } = fakeDrive();
-  const find = async (id) => (await readSheet(io)).rows.find((e) => e.id === id);
-  await appendRecord(io, { id: 'neg-0001-aaaa', ausgabe: 'A', ort: '', betrag: '10' });
-  await appendRecord(io, { id: 'neg-0002-aaaa', ausgabe: 'B', ort: '', betrag: '-10' });
-  await appendRecord(io, { id: 'pos-0001-aaaa', ausgabe: 'R', ort: '', betrag: '10', refund: true });
-  await appendRecord(io, { id: 'pos-0002-aaaa', ausgabe: 'R2', ort: '', betrag: '-10', refund: true });
-  await appendRecord(io, { id: 'neg-0003-aaaa', ausgabe: 'C', ort: '', betrag: '10', refund: 'true' });
-  assert.equal((await find('neg-0001-aaaa')).betrag, -10);
-  assert.equal((await find('neg-0002-aaaa')).betrag, -10);
-  assert.equal((await find('pos-0001-aaaa')).betrag, 10);
-  assert.equal((await find('pos-0002-aaaa')).betrag, 10);
-  assert.equal((await find('neg-0003-aaaa')).betrag, -10, 'nur das Boolean true zaehlt');
-  const row = await find('pos-0001-aaaa');
-  await updateRecord(io, { id: row.id, expectedHash: row.hash, values: { ausgabe: 'R', ort: '', betrag: 10 } });
-  assert.equal((await find('pos-0001-aaaa')).betrag, -10);
+  const u = newUser();
+  await addEntries(u, [{ id: 'syn-0001-aaaa', ausgabe: 'Eins', betrag: 1 }, { id: 'syn-0002-aaaa', ausgabe: 'Zwei', betrag: 2 }, { id: 'syn-0003-aaaa', ausgabe: 'Drei', betrag: 3 }]);
+  await sync(u, io);
+  const [e1, e2] = await listEntries(u);
+  await updateEntry(u, { id: e1.id, expectedHash: e1.hash, values: { ausgabe: 'Eins neu', ort: 'Ort', betrag: 5 } });
+  await deleteEntry(u, { id: e2.id, expectedHash: e2.hash });
+  assert.equal((await readState(u)).pending, 2, 'eine Aenderung, ein Loeschen');
+  const r = await sync(u, io);
+  assert.deepEqual([r.added, r.updated, r.removed], [0, 1, 1]);
+  const rows = await excelRows(io);
+  assert.equal(rows.length, 14, '12 Zeilen aus der Datei + 2 Eintraege');
+  assert.deepEqual(rows.slice(12).map((x) => [x.id, x.ausgabe, x.ort, x.betrag]), [['syn-0001-aaaa', 'Eins neu', 'Ort', -5], ['syn-0003-aaaa', 'Drei', '', -3]]);
+  assert.equal(rows[0].ausgabe, 'Wietzorke', 'vorhandene Zeilen bleiben');
+  assert.equal((await readState(u)).pending, 0);
 });
 
-test('append-many: mehrere Eintraege in einem Upload, Vorzeichen je Eintrag, idempotent', { skip }, async () => {
+test('Nie uebertragene Eintraege loeschen: kein Loesch-Vermerk, Excel bleibt unberuehrt', { skip }, async () => {
   const { io, state } = fakeDrive();
-  const records = [
-    { id: 'many-0001-aaaa', ausgabe: 'Rewe', ort: '', betrag: 15 },
-    { id: 'many-0002-aaaa', ausgabe: 'Edeka', ort: 'Bonn', betrag: '10' },
-    { id: 'many-0003-aaaa', ausgabe: 'Erstattung', ort: '', betrag: 5, refund: true },
-  ];
-  const before = state.uploads;
-  const r = await appendRecords(io, { records });
-  assert.equal(r.added, 3);
-  assert.equal(state.uploads, before + 1, 'ein einziger Upload');
-  const d = await readSheet(io);
-  assert.deepEqual(d.rows.slice(-3).map((e) => [e.id, e.ausgabe, e.ort, e.betrag]), [
-    ['many-0001-aaaa', 'Rewe', '', -15], ['many-0002-aaaa', 'Edeka', 'Bonn', -10], ['many-0003-aaaa', 'Erstattung', '', 5]]);
-  assert.deepEqual(d.rows.slice(-3).map((e) => e.row), [d.rows.at(-3).row, d.rows.at(-3).row + 1, d.rows.at(-3).row + 2], 'Zeilen ohne Luecke');
-  const again = await appendRecords(io, { records });
-  assert.equal(again.added, 0);
-  assert.equal(state.uploads, before + 1, 'Wiederholung laedt nichts hoch');
-  assert.equal((await readSheet(io)).rows.length, d.rows.length);
+  const u = newUser();
+  await add(u, { id: 'nie-0001-aaaa', ausgabe: 'A', betrag: 1 });
+  const [e] = await listEntries(u);
+  await deleteEntry(u, { id: e.id, expectedHash: e.hash });
+  assert.equal((await readState(u)).pending, 0);
+  await sync(u, io);
+  assert.equal(state.uploads, 0);
 });
 
-test('append-many: ungueltige Eintraege speichern nichts', { skip }, async () => {
+test('Aenderungen in Excel werden ignoriert: die App zeigt weiter die DB', { skip }, async () => {
   const { io, state } = fakeDrive();
-  const uploads = state.uploads;
-  await assert.rejects(appendRecords(io, { records: [{ ausgabe: 'ok', betrag: 1 }, { ausgabe: '', betrag: 1 }] }), (e) => e.status === 422);
-  await assert.rejects(appendRecords(io, { records: [] }), (e) => e.status === 400);
-  await assert.rejects(appendRecords(io, { records: Array.from({ length: 21 }, () => ({ ausgabe: 'x', betrag: 1 })) }), (e) => e.status === 400);
-  await assert.rejects(appendRecords(io, { records: [{ id: 'dup-aaaa-0001', ausgabe: 'a', betrag: 1 }, { id: 'dup-aaaa-0001', ausgabe: 'b', betrag: 1 }] }), (e) => e.code === 'bad_id');
-  assert.equal(state.uploads, uploads);
-  assert.equal((await readSheet(io)).rows.length, 12);
+  const u = newUser();
+  await add(u, { id: 'ign-0001-aaaa', ausgabe: 'Original', betrag: 1 });
+  await sync(u, io);
+  await state.externalEdit((ws) => { ws.getCell('B14').value = 'In Excel geaendert'; });
+  const st = await readState(u);
+  assert.equal(st.rows[0].ausgabe, 'Original');
+  assert.equal(st.pending, 0);
+  await add(u, { id: 'ign-0002-aaaa', ausgabe: 'Zweiter', betrag: 2 });
+  await sync(u, io);
+  assert.equal((await excelRows(io)).at(-2).ausgabe, 'In Excel geaendert', 'unveraenderte Eintraege werden nicht erneut geschrieben');
 });
 
-test('append ist idempotent: gleiche ID zweimal -> ein Eintrag', { skip }, async () => {
+test('Uebertragen: parallele Excel-Aenderung zwischen Lesen und Speichern geht nicht verloren', { skip }, async () => {
   const { io, state } = fakeDrive();
-  await appendRecord(io, { id: 'dup-0001-aaaa', ausgabe: 'Kaffee', ort: '', betrag: 3 });
-  const uploads = state.uploads;
-  const again = await appendRecord(io, { id: 'dup-0001-aaaa', ausgabe: 'Kaffee', ort: '', betrag: 3 });
-  assert.equal(again.duplicate, true);
-  assert.equal(state.uploads, uploads, 'kein zweiter Upload');
-  assert.equal((await readSheet(io)).rows.length, 13);
-});
-
-test('append: parallele Excel-Aenderung zwischen Lesen und Speichern geht nicht verloren', { skip }, async () => {
-  const { io, state } = fakeDrive();
+  const u = newUser();
+  await add(u, { ausgabe: 'Kaffee', ort: 'Bonn', betrag: 4 });
   state.beforeUpload = () => state.externalEdit((ws) => { ws.getCell('E2').value = 'Koeln'; });
-  const r = await appendRecord(io, { ausgabe: 'Kaffee', ort: 'Bonn', betrag: 4 });
+  const r = await sync(u, io);
   assert.equal(r.retries, 1);
-  const d = await readSheet(io);
-  assert.equal(d.rows[0].ort, 'Koeln', 'fremde Aenderung blieb erhalten');
-  assert.equal(d.rows.length, 13, 'neue Zeile ist vorhanden');
+  const rows = await excelRows(io);
+  assert.equal(rows[0].ort, 'Koeln', 'fremde Aenderung blieb erhalten');
+  assert.equal(rows.length, 13);
 });
 
-test('loeschen: Eintrag in der Mitte weg, Rest rueckt auf, Merges bleiben, naechster Eintrag ohne Luecke', { skip }, async () => {
+test('Verschluesselt in der DB: weder Text, Ort, Betrag noch Favoriten sind im Klartext gespeichert', async () => {
+  const u = newUser();
+  await add(u, { id: 'enc-0001-aaaa', ausgabe: 'Geheimausgabe', ort: 'Geheimort', betrag: '123,45' });
+  await saveFavorites(u, { favorites: [{ ausgabe: 'Geheimfavorit', ort: '', betrag: '' }], expectedHash: (await readFavorites(u)).hash });
+  const raw = JSON.stringify([...(await store.list(`expenses:${u.id}`)), await store.get('favorites', u.id)]);
+  for (const secret of ['Geheimausgabe', 'Geheimort', '123', 'Geheimfavorit']) assert.ok(!raw.includes(secret), `${secret} nicht im Klartext`);
+  assert.equal((await listEntries(u))[0].ausgabe, 'Geheimausgabe', 'Lesen entschluesselt');
+  const [row] = await store.list(`expenses:${u.id}`);
+  row.value.d = `${row.value.d.slice(0, -3)}AAA`;
+  await store.set(`expenses:${u.id}`, row.key, row.value);
+  await assert.rejects(listEntries(u), 'manipulierte Daten werden erkannt');
+});
+
+test('Leeren: loescht DB und Excel (nur Werte), Favoriten bleiben, naechster Eintrag landet in Zeile 2', { skip }, async () => {
   const { io, state } = fakeDrive();
-  await assignMissingIds(io);
-  const before = await readSheet(io);
-  const target = before.rows[3];
-  const mergesBefore = merges((await entries(state.buf))[SHEET]);
-  const r = await deleteRecord(io, { id: target.id, expectedHash: target.hash });
-  assert.equal(r.deleted, true);
-  const after = await readSheet(io);
-  assert.equal(after.rows.length, before.rows.length - 1);
-  assert.deepEqual(after.rows.map((e) => e.id), before.rows.filter((e) => e.id !== target.id).map((e) => e.id));
-  assert.deepEqual(after.rows.map((e) => e.betrag), before.rows.filter((e) => e.id !== target.id).map((e) => e.betrag));
-  assert.deepEqual(merges((await entries(state.buf))[SHEET]), mergesBefore, 'verbundene Zellen unveraendert');
-  const a = await appendRecord(io, { ausgabe: 'Neu', ort: '', betrag: 1 });
-  assert.equal(a.row, after.rows.at(-1).row + 1, 'keine Luecke');
-});
-
-test('loeschen: Konflikt bei geaenderter Zeile, idempotent bei fehlender ID', { skip }, async () => {
-  const { io, state } = fakeDrive();
-  await assignMissingIds(io);
-  const row = (await readSheet(io)).rows[0];
-  await assert.rejects(deleteRecord(io, { id: row.id, expectedHash: 'falsch' }), (e) => e.status === 409);
-  assert.equal((await readSheet(io)).rows.length, 12, 'nichts geloescht');
-  await deleteRecord(io, { id: row.id, expectedHash: row.hash });
-  const uploads = state.uploads;
-  const again = await deleteRecord(io, { id: row.id, expectedHash: row.hash });
-  assert.equal(again.deleted, false);
-  assert.equal(state.uploads, uploads, 'kein zweiter Upload');
-});
-
-test('loeschen: letzter Eintrag', { skip }, async () => {
-  const { io } = fakeDrive();
-  await assignMissingIds(io);
-  const rows = (await readSheet(io)).rows;
-  const last = rows.at(-1);
-  await deleteRecord(io, { id: last.id, expectedHash: last.hash });
-  const after = await readSheet(io);
-  assert.equal(after.rows.length, rows.length - 1);
-  assert.ok(!after.rows.some((e) => e.id === last.id));
-});
-
-test('IDs ergaenzen: nur fehlende, vorhandene bleiben, zweiter Lauf aendert nichts', { skip }, async () => {
-  const { io, state } = fakeDrive();
-  const r = await assignMissingIds(io);
-  assert.equal(r.assigned, 11);
-  const d = await readSheet(io);
-  assert.equal(d.missingIds, 0);
-  assert.equal(d.rows[11].id, '57583a13', 'vorhandene ID unveraendert');
-  assert.equal(new Set(d.rows.map((x) => x.id)).size, 12, 'alle eindeutig');
-  assert.match(rowXml((await entries(state.buf))[SHEET], 2), /<c r="A2"[^>]*t="inlineStr"/);
-  const uploads = state.uploads;
-  assert.equal((await assignMissingIds(io)).assigned, 0);
-  assert.equal(state.uploads, uploads);
-});
-
-test('update: aendert nur die Zellen der Zeile; Merge, Stil und ID bleiben', { skip }, async () => {
-  const { io, state } = fakeDrive();
-  await assignMissingIds(io);
-  const seen = (await readSheet(io)).rows[0];
+  const u = newUser();
+  await add(u, { id: 'clr-0001-aaaa', ausgabe: 'Alt', betrag: 1 });
+  await saveFavorites(u, { favorites: [{ ausgabe: 'Fav', ort: '', betrag: '' }], expectedHash: (await readFavorites(u)).hash });
+  await sync(u, io);
   const before = await entries(state.buf);
-  await updateRecord(io, { id: seen.id, expectedHash: seen.hash, values: { ausgabe: 'Wochenmarkt', ort: 'Bonn', betrag: 12.5 } });
+  const st = await readState(u);
+  await assert.rejects(clearAll(u, io, { expectedListHash: 'falsch' }), (e) => e.code === 'conflict');
+  assert.equal((await listEntries(u)).length, 1, 'bei Konflikt nichts geloescht');
+
+  const r = await clearAll(u, io, { expectedListHash: st.listHash });
+  assert.equal(r.cleared, 13);
+  assert.equal(r.summaryBefore.count, 1);
+  assert.equal(r.state.summary.count, 0);
+  assert.equal(r.state.favorites.items.length, 1);
   const after = await entries(state.buf);
-  for (let n = 3; n <= 13; n++) assert.equal(rowXml(after[SHEET], n), rowXml(before[SHEET], n), `Zeile ${n} unveraendert`);
-  assert.deepEqual(merges(after[SHEET]), merges(before[SHEET]));
-  const row2 = rowXml(after[SHEET], 2);
-  assert.match(row2, /<c r="F2" s="2"><v>-12.5<\/v>/);
-  const e = (await readSheet(io)).rows[0];
-  assert.deepEqual([e.id, e.ausgabe, e.ort, e.betrag], [seen.id, 'Wochenmarkt', 'Bonn', -12.5]);
-});
-
-test('update: Konflikt, wenn dieselbe Zeile in Excel geaendert wurde -> nichts ueberschrieben', { skip }, async () => {
-  const { io, state } = fakeDrive();
-  await assignMissingIds(io);
-  const seen = (await readSheet(io)).rows[0];
-  await state.externalEdit((ws) => { ws.getCell('F2').value = -99; });
-  const before = state.uploads;
-  await assert.rejects(
-    updateRecord(io, { id: seen.id, expectedHash: seen.hash, values: { ausgabe: 'x', ort: '', betrag: 1 } }),
-    (e) => e.status === 409 && e.code === 'conflict' && e.extra.current.betrag === -99,
-  );
-  assert.equal(state.uploads, before);
-});
-
-test('update: Race zwischen Snapshot und Upload auf derselben Zeile wird als Konflikt erkannt', { skip }, async () => {
-  const { io, state } = fakeDrive();
-  await assignMissingIds(io);
-  const seen = (await readSheet(io)).rows[0];
-  state.beforeUpload = () => state.externalEdit((ws) => { ws.getCell('F2').value = -77; });
-  await assert.rejects(
-    updateRecord(io, { id: seen.id, expectedHash: seen.hash, values: { ausgabe: 'x', ort: '', betrag: 1 } }),
-    (e) => e.code === 'conflict',
-  );
-  assert.equal((await readSheet(io)).rows[0].betrag, -77);
-});
-
-test('update: Eintrag in Excel geloescht -> 404', { skip }, async () => {
-  const { io, state } = fakeDrive();
-  await assignMissingIds(io);
-  const seen = (await readSheet(io)).rows[0];
-  await state.externalEdit((ws) => { ws.spliceRows(2, 1); });
-  await assert.rejects(updateRecord(io, { id: seen.id, expectedHash: seen.hash, values: { ausgabe: 'x', ort: '', betrag: 1 } }), (e) => e.status === 404);
-});
-
-test('Excel leeren: nur Werte weg, Zeilen/Stile/Merges bleiben; naechster Eintrag landet in Zeile 2', { skip }, async () => {
-  const { io, state } = fakeDrive();
-  await assignMissingIds(io);
-  const d = await readSheet(io);
-  const before = await entries(state.buf);
-  const r = await clearList(io, { expectedListHash: d.listHash });
-  assert.equal(r.cleared, 12);
-  assert.equal(r.summaryBefore.count, 12);
-
-  const after = await entries(state.buf);
-  for (const name of Object.keys(before)) if (name !== SHEET) assert.equal(after[name], before[name]);
   assert.deepEqual(merges(after[SHEET]), merges(before[SHEET]), 'Merges unveraendert');
   assert.equal(rowXml(after[SHEET], 1), rowXml(before[SHEET], 1), 'Kopfzeile unveraendert');
   assert.match(rowXml(after[SHEET], 5), /<c r="B5" s="5"\/>/, 'Stil bleibt, Wert weg');
-  assert.match(rowXml(after[SHEET], 5), /<c r="F5" s="4"\/>/);
-  const empty = await readSheet(io);
-  assert.equal(empty.rows.length, 0);
-  assert.equal(empty.summary.total, 0);
+  assert.equal((await excelRows(io)).length, 0);
 
-  const a = await appendRecord(io, { ausgabe: 'Neu', ort: 'dm', betrag: 18.95 });
-  assert.equal(a.row, 2);
-  assert.equal(merges((await entries(state.buf))[SHEET]).length, 12, 'kein zusaetzlicher Merge');
+  await add(u, { ausgabe: 'Neu', ort: 'dm', betrag: 18.95 });
+  await sync(u, io);
+  assert.equal((await excelRows(io))[0].ausgabe, 'Neu', 'landet in Zeile 2');
+  assert.equal(merges((await entries(state.buf))[SHEET]).length, merges(before[SHEET]).length, 'kein zusaetzlicher Merge');
 });
 
-test('Excel leeren: blockiert bei geaenderter Liste, fehlenden IDs und fremden Inhalten', { skip }, async () => {
+test('Leeren: bei fremden Inhalten in der Datei bricht es ab und laesst die DB unveraendert', { skip }, async () => {
   const { io, state } = fakeDrive();
-  await assert.rejects(clearList(io, { expectedListHash: 'x' }), (e) => e.code === 'conflict');
-  await assignMissingIds(io);
-  const d = await readSheet(io);
-  await assert.rejects(clearList(io, { expectedListHash: 'falsch' }), (e) => e.code === 'conflict');
-
+  const u = newUser();
+  await add(u, { ausgabe: 'Bleibt', betrag: 1 });
   await state.externalEdit((ws) => { ws.getCell('H5').value = 'Notiz'; });
-  const d2 = await readSheet(io);
-  const before = state.uploads;
-  await assert.rejects(clearList(io, { expectedListHash: d2.listHash }), (e) => e.code === 'not_a_list');
-  assert.equal(state.uploads, before);
-  assert.equal((await readSheet(io)).rows.length, d.rows.length);
+  const st = await readState(u);
+  const uploads = state.uploads;
+  await assert.rejects(clearAll(u, io, { expectedListHash: st.listHash }), (e) => e.code === 'not_a_list');
+  assert.equal(state.uploads, uploads);
+  assert.equal((await listEntries(u)).length, 1);
 });
 
-test('Excel leeren: blockiert, wenn Eintraege ohne ID existieren', { skip }, async () => {
+test('Excel bereitstellen: uebertraegt zuerst und liefert genau die Datei aus OneDrive', { skip }, async () => {
+  const { io, state } = fakeDrive();
+  const u = newUser();
+  await add(u, { ausgabe: 'Frisch', ort: '', betrag: 9 });
+  const out = await exportExcel(u, io);
+  assert.equal(out.name, 'test.xlsx');
+  assert.ok(out.buf.equals(state.buf), 'identisch mit der Datei in OneDrive');
+  assert.equal((await excelRows(io)).at(-1).ausgabe, 'Frisch');
+  const again = await exportExcel(u, io);
+  assert.ok(again.buf.equals(state.buf));
+  assert.equal(state.uploads, 1, 'zweites Bereitstellen ohne Aenderung laedt nichts hoch');
+});
+
+test('Favoriten: speichern, Reihenfolge, Grenzen, Dubletten und Konflikt mit veraltetem Stand', async () => {
+  const u = newUser();
+  const fav = (ausgabe, ort = '', betrag = '') => ({ ausgabe, ort, betrag });
+  const h0 = (await readFavorites(u)).hash;
+  const r = await saveFavorites(u, { favorites: [fav('Brot', 'Baecker', 2.5), fav('Bus')], expectedHash: h0 });
+  assert.deepEqual(r.favorites.items.map((f) => f.ausgabe), ['Brot', 'Bus']);
+  await assert.rejects(saveFavorites(u, { favorites: [fav('X')], expectedHash: h0 }), (e) => e.code === 'conflict' && e.extra.favorites.items.length === 2);
+  const h1 = r.favorites.hash;
+  await assert.rejects(saveFavorites(u, { favorites: [fav('A'), fav('a')], expectedHash: h1 }), (e) => e.code === 'bad_value');
+  await assert.rejects(saveFavorites(u, { favorites: [fav('')], expectedHash: h1 }), (e) => e.status === 422);
+  await assert.rejects(saveFavorites(u, { favorites: Array.from({ length: 31 }, (_, i) => fav(`F${i}`)), expectedHash: h1 }), (e) => e.status === 400);
+  assert.equal((await readFavorites(u)).items.length, 2);
+  assert.equal((await readFavorites(newUser())).items.length, 0);
+});
+
+test('Einmalige Uebernahme: Eintraege mit ID aus der Datei, danach zaehlt nur die DB', { skip }, async () => {
+  const { io, state } = fakeDrive();
+  const u = newUser();
+  assert.equal(await importFromExcelOnce(u, io), true);
+  const st = await readState(u);
+  assert.deepEqual(st.rows.map((r) => r.id), ['57583a13'], 'nur Zeilen mit ID');
+  assert.equal(st.pending, 0, 'schon in Excel vorhanden');
+  assert.equal(await importFromExcelOnce(u, io), false);
+  await state.externalEdit((ws) => { ws.getCell('B14').value = 'x'; });
+  assert.equal((await readState(u)).rows.length, 1);
+});
+
+test('Einmalige Uebernahme: scheitert das Lesen, wird es spaeter erneut versucht', { skip }, async () => {
   const { io } = fakeDrive();
-  const d = await readSheet(io);
-  await assert.rejects(clearList(io, { expectedListHash: d.listHash }), (e) => e.code === 'missing_ids');
+  const u = newUser();
+  const broken = { ...io, download: async () => { throw new Error('offline'); } };
+  assert.equal(await importFromExcelOnce(u, broken), false);
+  assert.equal(await importFromExcelOnce(u, io), true);
 });
 
 test('fehlende Pflichtspalten werden mit den gefundenen Ueberschriften gemeldet', async () => {
@@ -328,20 +329,11 @@ test('fehlende Pflichtspalten werden mit den gefundenen Ueberschriften gemeldet'
   await assert.rejects(readSheet(io), (e) => e.code === 'bad_layout' && /"Foo", "Bar"/.test(e.message));
 });
 
-test('Eingaben werden validiert', { skip }, async () => {
-  const { io, state } = fakeDrive();
-  for (const bad of [{ ausgabe: '', betrag: 1 }, { ausgabe: 'x', betrag: 'abc' }, { ausgabe: 'x', betrag: 0 }]) {
-    await assert.rejects(appendRecord(io, bad), (e) => e.status === 422);
-  }
-  await assert.rejects(appendRecord(io, { id: 'a b', ausgabe: 'x', betrag: 1 }), (e) => e.code === 'bad_id');
-  assert.equal(state.uploads, 0);
-});
-
 test('Token-Verschluesselung: Roundtrip und Manipulationserkennung', () => {
   const c = encrypt('refresh-token-geheim');
   assert.ok(!c.includes('geheim'));
   assert.equal(decrypt(c), 'refresh-token-geheim');
-  const parts = c.split('.'); parts[3] = parts[3].slice(0, -2) + 'AA';
+  const parts = c.split('.'); parts[3] = `${parts[3].slice(0, -2)}AA`;
   assert.throws(() => decrypt(parts.join('.')));
 });
 
@@ -359,186 +351,22 @@ async function backIdFixture() {
   return Buffer.from(await wb.xlsx.writeBuffer());
 }
 
-test('Layout mit ID hinten und Ausgabe in A:C: lesen, anhaengen, IDs ergaenzen, leeren', async () => {
+test('Layout mit ID hinten und Ausgabe in A:C: uebertragen und leeren', async () => {
   const { io, state } = fakeDrive(await backIdFixture());
-  const d = await readSheet(io);
-  assert.deepEqual(d.rows.map((r) => [r.ausgabe, r.ort, r.betrag]), [['Brot', '', -2.5], ['Bus', 'Hamburg', -3]]);
-
-  await assignMissingIds(io);
-  const a = await appendRecord(io, { ausgabe: 'Kaffee', ort: '', betrag: 4.2 });
-  assert.equal(a.row, 4);
+  const u = newUser();
+  await add(u, { id: 'bak-0001-aaaa', ausgabe: 'Kaffee', ort: '', betrag: 4.2 });
+  await sync(u, io);
   const sheet = (await entries(state.buf))[SHEET];
   assert.ok(merges(sheet).includes('A4:C4'), 'neuer verbundener Bereich A4:C4');
   assert.match(rowXml(sheet, 4), /<c r="E4"[^>]*><v>-4.2<\/v>/);
   assert.match(rowXml(sheet, 4), /<c r="F4"[^>]*t="inlineStr"/, 'ID steht hinten in F');
 
-  const d2 = await readSheet(io);
-  await clearList(io, { expectedListHash: d2.listHash });
-  const sheet2 = (await entries(state.buf))[SHEET];
-  assert.deepEqual(merges(sheet2), merges(sheet));
+  await clearAll(u, io, { expectedListHash: (await readState(u)).listHash });
+  assert.deepEqual(merges((await entries(state.buf))[SHEET]), merges(sheet));
   assert.equal((await readSheet(io)).rows.length, 0);
 });
 
-// ---- Favoriten-Blatt ------------------------------------------------------------------------
-
-const fav = (ausgabe, ort = '', betrag = '') => ({ ausgabe, ort, betrag });
-
-test('Favoriten: Blatt wird angelegt, Liste und Eintraege bleiben unveraendert, Wiederlesen liefert dieselben Werte', { skip }, async () => {
-  const { io, state } = fakeDrive();
-  const before = await entries(state.buf);
-  const d0 = await readSheet(io);
-  assert.deepEqual(d0.favorites, { exists: false, items: [], hash: d0.favorites.hash });
-
-  const items = [fav('Brötchen', 'Bäcker Müller', 6.5), fav('Tanken', 'Aral'), fav('Fish & <Chips>', '', 12)];
-  await saveFavorites(io, { favorites: items, expectedHash: d0.favorites.hash });
-
-  const after = await entries(state.buf);
-  assert.equal(after[SHEET], before[SHEET], 'Erfassungsliste unveraendert');
-  for (const name of Object.keys(before)) {
-    if (!/workbook\.xml(\.rels)?$|Content_Types/.test(name)) assert.equal(after[name], before[name], `${name} unveraendert`);
-  }
-  assert.match(after['xl/workbook.xml'], /<sheet name="Favoriten"/);
-
-  const d1 = await readSheet(io);
-  assert.deepEqual(d1.favorites.items, items);
-  assert.equal(d1.rows.length, d0.rows.length);
-  assert.equal(d1.sheet, d0.sheet);
-
-  const wb = new ExcelJS.Workbook(); await wb.xlsx.load(state.buf);
-  const ws = wb.getWorksheet('Favoriten');
-  assert.deepEqual(ws.getRow(1).values.slice(1), ['Ausgabe', 'Ort', 'Betrag']);
-  assert.equal(ws.getCell('A4').value, 'Fish & <Chips>');
-  assert.equal(ws.getCell('C2').value, 6.5);
-  assert.equal(wb.worksheets.length, 2);
-});
-
-test('Favoriten: aendern, entfernen (Zeilen dahinter werden geleert), Excel-Aenderung wird erkannt', { skip }, async () => {
-  const { io, state } = fakeDrive();
-  const h = (await readSheet(io)).favorites.hash;
-  const a = await saveFavorites(io, { favorites: [fav('A', 'x', 1), fav('B'), fav('C', '', 3)], expectedHash: h });
-  const b = await saveFavorites(io, { favorites: [fav('C', '', 3), fav('A', 'y')], expectedHash: a.favorites.hash });
-  assert.deepEqual((await readSheet(io)).favorites.items, [fav('C', '', 3), fav('A', 'y')]);
-  assert.equal(b.favorites.hash, (await readSheet(io)).favorites.hash);
-
-  const uploads = state.uploads;
-  await saveFavorites(io, { favorites: [fav('C', '', 3), fav('A', 'y')], expectedHash: b.favorites.hash });
-  assert.equal(state.uploads, uploads, 'unveraenderte Liste wird nicht hochgeladen');
-
-  // "Benutzer" aendert das Blatt direkt in Excel -> veralteter Stand wird nicht ueberschrieben.
-  const wb = new ExcelJS.Workbook(); await wb.xlsx.load(state.buf);
-  wb.getWorksheet('Favoriten').getCell('A4').value = 'Von Hand';
-  wb.getWorksheet('Favoriten').getCell('B4').value = 'Excel';
-  state.buf = Buffer.from(await wb.xlsx.writeBuffer()); state.v++;
-  const cur = await readSheet(io);
-  assert.deepEqual(cur.favorites.items.at(-1), fav('Von Hand', 'Excel'), 'Eintrag aus Excel (Shared Strings) wird gelesen');
-  await assert.rejects(saveFavorites(io, { favorites: [fav('X')], expectedHash: b.favorites.hash }), (e) => e.code === 'conflict');
-  assert.equal((await readSheet(io)).favorites.items.length, 3);
-  await saveFavorites(io, { favorites: [], expectedHash: cur.favorites.hash });
-  assert.deepEqual((await readSheet(io)).favorites.items, []);
-});
-
-test('Favoriten: parallele Aenderung der Erfassungsliste zwischen Lesen und Speichern geht nicht verloren', { skip }, async () => {
-  const { io, state } = fakeDrive();
-  const d = await readSheet(io);
-  state.beforeUpload = () => state.externalEdit((ws) => { ws.getCell('H20').value = 'Notiz'; });
-  await saveFavorites(io, { favorites: [fav('Brot')], expectedHash: d.favorites.hash });
-  const wb = new ExcelJS.Workbook(); await wb.xlsx.load(state.buf);
-  assert.equal(wb.worksheets[0].getCell('H20').value, 'Notiz');
-  assert.deepEqual((await readSheet(io)).favorites.items, [fav('Brot')]);
-});
-
-test('Favoriten: ungueltige Eingaben speichern nichts', { skip }, async () => {
-  const { io, state } = fakeDrive();
-  const h = (await readSheet(io)).favorites.hash;
-  for (const bad of [[fav('')], [{ ausgabe: 'x', ort: '', betrag: 'abc' }], [fav('x', '', 0)], [fav('x', '', -2)], [fav('a'.repeat(201))], [fav('Rewe', 'A'), fav('REWE', 'a')]]) {
-    await assert.rejects(saveFavorites(io, { favorites: bad, expectedHash: h }), (e) => e.status === 422);
-  }
-  await assert.rejects(saveFavorites(io, { favorites: Array.from({ length: 31 }, (_, i) => fav(`F${i}`)), expectedHash: h }), (e) => e.status === 400);
-  await assert.rejects(saveFavorites(io, { favorites: 'x', expectedHash: h }), (e) => e.status === 400);
-  await assert.rejects(saveFavorites(io, { favorites: [], expectedHash: '' }), (e) => e.status === 400);
-  assert.equal(state.uploads, 0);
-});
-
-test('Favoriten-Blatt stoert Loeschen und "Excel leeren" nicht und bleibt dabei erhalten', { skip }, async () => {
-  const { io } = fakeDrive();
-  await assignMissingIds(io);
-  await saveFavorites(io, { favorites: [fav('Brot', 'Lidl', 2)], expectedHash: (await readSheet(io)).favorites.hash });
-  const d = await readSheet(io);
-  await deleteRecord(io, { id: d.rows[0].id, expectedHash: d.rows[0].hash });
-  const d2 = await readSheet(io);
-  assert.equal(d2.rows.length, d.rows.length - 1);
-  await clearList(io, { expectedListHash: d2.listHash });
-  const d3 = await readSheet(io);
-  assert.equal(d3.rows.length, 0);
-  assert.deepEqual(d3.favorites.items, [fav('Brot', 'Lidl', 2)]);
-  await appendRecord(io, { ausgabe: 'Neu', betrag: 1 });
-  assert.equal((await readSheet(io)).rows.length, 1);
-});
-
-test('Favoriten: Blatt vor der Liste wird nicht mit der Liste verwechselt; kaputtes Blatt blockiert nichts', async () => {
-  const wb = new ExcelJS.Workbook();
-  wb.addWorksheet('Favoriten').addRow(['Foo']);
-  wb.addWorksheet('Liste').addRow(['ID', 'Ausgabe', 'Betrag']);
-  const { io } = fakeDrive(Buffer.from(await wb.xlsx.writeBuffer()));
-  const d = await readSheet(io);
-  assert.equal(d.sheet, 'Liste');
-  assert.equal(d.favorites.broken, true);
-  await appendRecord(io, { ausgabe: 'Brot', betrag: 2 });
-  await assert.rejects(saveFavorites(io, { favorites: [fav('X')], expectedHash: d.favorites.hash }), (e) => e.code === 'bad_layout');
-  assert.equal((await readSheet(io)).rows.length, 1);
-});
-
-test('Favoriten: Layout mit ID hinten, ohne Fixture-Datei; Leeren laesst das Favoriten-Blatt stehen', async () => {
-  const { io } = fakeDrive(await backIdFixture());
-  const d = await readSheet(io);
-  await saveFavorites(io, { favorites: [fav('Kaffee', '', 4.2)], expectedHash: d.favorites.hash });
-  await assignMissingIds(io);
-  const d2 = await readSheet(io);
-  await clearList(io, { expectedListHash: d2.listHash });
-  assert.deepEqual((await readSheet(io)).favorites.items, [fav('Kaffee', '', 4.2)]);
-});
-
-// ---- Performance: Antwort enthaelt den neuen Stand, Lesen/Schreiben brauchen wenige Aufrufe ----
-
-const sameState = (state, fresh) => {
-  assert.ok(state, 'Antwort enthaelt den Stand');
-  for (const k of ['sheet', 'rows', 'summary', 'missingIds', 'listHash', 'favorites']) assert.deepEqual(state[k], fresh[k], k);
-};
-
-test('Antwort jeder Aenderung enthaelt den Stand, der einem frischen Lesen entspricht', { skip }, async () => {
-  const { io } = fakeDrive();
-  let r = await assignMissingIds(io);
-  sameState(r.state, await readSheet(io));
-
-  r = await appendRecord(io, { ausgabe: 'Brot', ort: 'Lidl', betrag: 2.5 });
-  sameState(r.state, await readSheet(io));
-  const again = await appendRecord(io, { id: r.id, ausgabe: 'Brot', ort: 'Lidl', betrag: 2.5 });
-  assert.equal(again.duplicate, true);
-  sameState(again.state, await readSheet(io));
-
-  r = await appendRecords(io, { records: [{ ausgabe: 'A', betrag: 1 }, { ausgabe: 'B', ort: 'x', betrag: 2, refund: true }] });
-  sameState(r.state, await readSheet(io));
-
-  const d = await readSheet(io);
-  const last = d.rows.at(-1);
-  r = await updateRecord(io, { id: last.id, expectedHash: last.hash, values: { ausgabe: 'B2', ort: 'y', betrag: 3 } });
-  sameState(r.state, await readSheet(io));
-
-  const d2 = await readSheet(io);
-  r = await deleteRecord(io, { id: d2.rows[2].id, expectedHash: d2.rows[2].hash });
-  sameState(r.state, await readSheet(io));
-
-  r = await saveFavorites(io, { favorites: [fav('Brot', 'Lidl', 2)], expectedHash: (await readSheet(io)).favorites.hash });
-  sameState(r.state, await readSheet(io));
-  assert.deepEqual(r.state.favorites, r.favorites);
-
-  const d3 = await readSheet(io);
-  r = await clearList(io, { expectedListHash: d3.listHash });
-  sameState(r.state, await readSheet(io));
-  assert.equal(r.state.rows.length, 0);
-});
-
-test('Aufrufe pro Vorgang: Lesen 1 Runde (parallel), Aendern Metadaten, Inhalt, Upload', { skip }, async () => {
+test('Aufrufe: Erfassen ohne Excel-Zugriff, Uebertragen = Metadaten, Inhalt, Upload; nichts zu tun = kein Upload', { skip }, async () => {
   const { io } = fakeDrive();
   const calls = [];
   const traced = {
@@ -546,16 +374,56 @@ test('Aufrufe pro Vorgang: Lesen 1 Runde (parallel), Aendern Metadaten, Inhalt, 
     download: async () => { calls.push('download'); return io.download(); },
     upload: async (b, e) => { calls.push('upload'); return io.upload(b, e); },
   };
-  await readSheet(traced);
-  assert.deepEqual([...calls].sort(), ['download', 'meta']);
-  calls.length = 0;
-  await appendRecord(traced, { ausgabe: 'X', betrag: 1 });
+  const u = newUser();
+  await add(u, { ausgabe: 'X', betrag: 1 });
+  await readState(u);
+  assert.deepEqual(calls, []);
+  await sync(u, traced);
   assert.deepEqual(calls, ['meta', 'download', 'upload']);
+  calls.length = 0;
+  await sync(u, traced);
+  assert.deepEqual(calls, ['meta', 'download']);
 });
 
-test('exportFile liefert Name und unveraenderte Bytes', { skip }, async () => {
-  const { io } = fakeDrive();
-  const out = await exportFile(io);
-  assert.equal(out.name, 'test.xlsx');
-  assert.ok(out.buf.equals(original()));
+test('Tresor: anlegen, entsperren, doppeltes Anlegen und unbekanntes Passwort', async () => {
+  const key = newKey();
+  await assert.rejects(requireVault(reqWith(key)), (e) => e.code === 'vault_locked', 'ohne Tresor kein Zugriff');
+  await assert.rejects(unlockVault(reqWith(key), 'ms:a'), (e) => e.code === 'vault_unknown', 'Entsperren legt nichts an');
+  await assert.rejects(requireVault(reqWith(key)), (e) => e.code === 'vault_locked');
+  const v = await createVault(reqWith(key));
+  assert.equal((await requireVault(reqWith(key))).id, v.id);
+  assert.equal((await unlockVault(reqWith(key), 'ms:a')).id, v.id);
+  await assert.rejects(createVault(reqWith(key)), (e) => e.code === 'vault_exists');
+  for (const bad of [undefined, '', 'zu-kurz', Buffer.alloc(16).toString('base64url')]) {
+    await assert.rejects(requireVault(reqWith(bad)), (e) => e.code === 'vault_locked');
+  }
+  assert.match(vaultSalt(), /^[0-9a-f]{64}$/);
+});
+
+test('Tresor: jedes Passwort hat eigene Daten; mit dem Schluessel eines anderen ist nichts zu lesen', async () => {
+  const keyA = newKey();
+  const keyB = newKey();
+  const a = await createVault(reqWith(keyA));
+  const b = await createVault(reqWith(keyB));
+  assert.notEqual(a.id, b.id);
+  await add(a, { id: 'tre-0001-aaaa', ausgabe: 'Nur fuer A', betrag: 5 });
+  assert.equal((await listEntries(b)).length, 0, 'B sieht nichts von A');
+  assert.equal((await listEntries(a)).length, 1);
+  // Selbst mit A's Datensatz unter B's Schluessel: nicht entschluesselbar.
+  const [row] = await store.list(`expenses:${a.id}`);
+  await store.set(`expenses:${b.id}`, row.key, row.value);
+  await assert.rejects(listEntries(b));
+  assert.equal(JSON.stringify(row.value).includes('Nur fuer A'), false);
+});
+
+test('Tresor: nach 5 Fehlversuchen wird gesperrt, richtiges Passwort setzt den Zaehler zurueck', async () => {
+  const ok = newKey();
+  await createVault(reqWith(ok));
+  const user = 'ms:throttle';
+  for (let i = 0; i < 5; i++) await assert.rejects(unlockVault(reqWith(newKey()), user), (e) => e.code === 'vault_unknown');
+  await assert.rejects(unlockVault(reqWith(ok), user), (e) => e.code === 'vault_throttled', 'auch das richtige Passwort ist kurz gesperrt');
+  await store.delete('attempts', user);
+  await assert.rejects(unlockVault(reqWith(newKey()), user), (e) => e.code === 'vault_unknown');
+  assert.ok(await unlockVault(reqWith(ok), user));
+  assert.equal(await store.get('attempts', user), null);
 });
