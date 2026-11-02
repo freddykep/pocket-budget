@@ -906,6 +906,75 @@ async function openClearSheet() {
   );
 }
 
+// ---- Excel bereitstellen -----------------------------------------------------------------------
+
+const XLSX_TYPE = 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet';
+
+// Laedt die Kopie der Excel-Datei. Die Datei wird schon beim Oeffnen des Dialogs geholt: Das Teilen-Menue des
+// Browsers verlangt eine frische Benutzeraktion und darf nicht erst nach einer langen Wartezeit starten.
+async function fetchExcelCopy() {
+  if (!navigator.onLine) throw new ApiError('offline');
+  const ctl = new AbortController();
+  const timer = setTimeout(() => ctl.abort(), 40_000);
+  try {
+    const res = await fetch('/api/excel/download', { signal: ctl.signal, credentials: 'same-origin' });
+    if (!res.ok) {
+      const data = await res.json().catch(() => ({}));
+      throw new ApiError(data.error?.code || 'internal', data.error?.message, data.error);
+    }
+    const disposition = res.headers.get('content-disposition') || '';
+    const star = /filename\*=UTF-8''([^;]+)/i.exec(disposition);
+    let name = state.me?.selectedFile?.name || 'Pocket-Budget.xlsx';
+    if (star) { try { name = decodeURIComponent(star[1]); } catch { /* Name aus dem Konto behalten */ } }
+    return new File([await res.blob()], name, { type: XLSX_TYPE });
+  } catch (e) {
+    if (e instanceof ApiError) throw e;
+    throw new ApiError(e.name === 'AbortError' ? 'timeout' : 'offline');
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
+function openShareExcel() {
+  openSheet(h('h2', { text: 'Excel bereitstellen' }), h('p', { text: 'Excel-Datei wird geladen …' }),
+    h('div', { class: 'actions' }, h('button', { class: 'btn ghost', onclick: closeSheet, text: 'Abbrechen' })));
+  fetchExcelCopy().then(
+    (file) => {
+      if (!$sheet.open) return; // Dialog wurde inzwischen geschlossen
+      const canShare = typeof navigator.canShare === 'function' && navigator.canShare({ files: [file] });
+      const download = () => {
+        const url = URL.createObjectURL(file);
+        const a = h('a', { href: url, download: file.name });
+        document.body.append(a);
+        a.click();
+        a.remove();
+        setTimeout(() => URL.revokeObjectURL(url), 60_000);
+        toast('Excel-Datei heruntergeladen');
+      };
+      const share = async () => {
+        try {
+          await navigator.share({ files: [file], title: file.name });
+        } catch (e) {
+          if (e.name !== 'AbortError') toast('Teilen nicht möglich. Bitte stattdessen herunterladen.');
+        }
+      };
+      openSheet(
+        h('h2', { text: 'Excel bereitstellen' }),
+        h('p', { text: `Eine Kopie von „${file.name}“ (Stand jetzt) kannst du herunterladen oder zum Beispiel per WhatsApp, Mail oder Teams teilen. Deine Datei in OneDrive bleibt unverändert.` }),
+        h('div', { class: 'stack' },
+          canShare ? h('button', { class: 'btn', onclick: share, text: 'Teilen …' }) : null,
+          h('button', { class: canShare ? 'btn secondary' : 'btn', onclick: download, text: 'Herunterladen' })),
+        h('div', { class: 'actions' }, h('button', { class: 'btn ghost', onclick: closeSheet, text: 'Schließen' })),
+      );
+    },
+    (e) => {
+      if (authExpired(e)) return goLogin(e);
+      openSheet(h('h2', { text: 'Excel bereitstellen' }), h('p', { text: errorMessage(e) }),
+        h('div', { class: 'actions' }, h('button', { class: 'btn ghost', onclick: closeSheet, text: 'Schließen' }), h('button', { class: 'btn', onclick: openShareExcel, text: 'Erneut versuchen' })));
+    },
+  );
+}
+
 // ---- Verbindung / Einstellungen --------------------------------------------------------------
 
 function openSettings() {
@@ -916,6 +985,7 @@ function openSettings() {
       h('div', {}, h('dt', { text: 'Microsoft-Konto' }), h('dd', { text: `${me.displayName ?? ''} (${me.account ?? ''})` })),
       h('div', {}, h('dt', { text: 'Excel-Datei' }), h('dd', { text: me.selectedFile?.name ?? '–' }))),
     h('div', { class: 'stack' },
+      h('button', { class: 'btn secondary', onclick: openShareExcel, text: 'Excel bereitstellen' }),
       h('button', { class: 'btn secondary', onclick: openFavorites, text: '☆ Favoriten verwalten' }),
       h('button', { class: 'btn secondary', onclick: () => { closeSheet(); renderFilePicker(); }, text: 'Andere Datei wählen' }),
       h('button', { class: 'btn ghost', onclick: openDisconnect, text: 'Verbindung trennen' })),
