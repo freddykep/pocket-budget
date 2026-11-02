@@ -39,14 +39,14 @@ const routes = {
 
 createServer(wrap(async (req, res) => {
   const { pathname } = new URL(req.url, 'http://x');
+  if (pathname === '/api/excel/read' && drive.signedIn && new URL(req.url, 'http://x').searchParams.get('download') === '1') {
+    const f = await exportFile(io);
+    return sendFile(res, f.buf, f.name, 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
+  }
   const route = routes[pathname];
   if (route) {
     if (!drive.signedIn && pathname.startsWith('/api/') && pathname !== '/api/auth/logout') throw new HttpError(401, 'not_signed_in', 'Nicht angemeldet');
     return send(res, 200, await route(req));
-  }
-  if (pathname === '/api/excel/download' && drive.signedIn) {
-    const f = await exportFile(io);
-    return sendFile(res, f.buf, f.name, 'application/vnd.openxmlformats-officedocument.spreadsheetml.sheet');
   }
   if (pathname === '/api/auth/login') { drive.signedIn = true; res.statusCode = 302; res.setHeader('location', '/'); return res.end(); }
   const rel = pathname === '/' ? '/index.html' : pathname;

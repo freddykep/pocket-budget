@@ -917,7 +917,7 @@ async function fetchExcelCopy() {
   const ctl = new AbortController();
   const timer = setTimeout(() => ctl.abort(), 40_000);
   try {
-    const res = await fetch('/api/excel/download', { signal: ctl.signal, credentials: 'same-origin' });
+    const res = await fetch('/api/excel/read?download=1', { signal: ctl.signal, credentials: 'same-origin' });
     if (!res.ok) {
       const data = await res.json().catch(() => ({}));
       throw new ApiError(data.error?.code || 'internal', data.error?.message, data.error);
